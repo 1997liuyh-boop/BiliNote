@@ -32,8 +32,8 @@ const TranscriberPage = lazy(() => import('@/pages/SettingPage/transcriber.tsx')
 const NotFoundPage = lazy(() => import('@/pages/NotFoundPage'))
 
 function App() {
-  useTaskPolling(3000) // 每 3 秒轮询一次
   const { loading, initialized, failed, lastError, retry } = useCheckBackend()
+  useTaskPolling(5000, initialized) // 后端就绪后同步服务器历史。
 
   // 在后端初始化完成后执行系统检查
   useEffect(() => {

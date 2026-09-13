@@ -49,7 +49,7 @@ request.interceptors.response.use(
     const res = error?.response?.data as IResponse | undefined;
     if (res) {
       // 如果后端有返回错误信息，则显示后端信息
-      if (!suppress) toast.error(res.msg || '服务器错误，请稍后再试');
+      if (!suppress) toast.error(res.msg || (typeof (res as any).detail === 'string' ? (res as any).detail : '服务器错误，请稍后再试'));
       return Promise.reject(res);
     } else {
       // 没有响应数据（如网络中断），显示通用网络错误

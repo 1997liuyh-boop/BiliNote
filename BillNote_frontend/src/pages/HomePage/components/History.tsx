@@ -1,4 +1,4 @@
-import NoteHistory from '@/pages/HomePage/components/NoteHistory.tsx'
+import NoteHistory from '@/pages/HomePage/components/LibraryHistory.tsx'
 import { useTaskStore } from '@/store/taskStore'
 import { Info, Clock, Loader2 } from 'lucide-react'
 import { ScrollArea } from '@/components/ui/scroll-area.tsx'

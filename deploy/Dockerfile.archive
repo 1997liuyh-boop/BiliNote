@@ -1,0 +1,3 @@
+FROM bilinote-local:20260909-download-fix
+COPY backend /app/backend
+COPY frontend-dist /usr/share/nginx/html

@@ -108,7 +108,7 @@ const HomeLayout: FC<IProps> = ({ NoteForm, Preview, History }) => {
         {/* 中间历史 */}
         <ResizablePanel
           ref={middlePanelRef}
-          defaultSize={16}
+          defaultSize={22}
           minSize={10}
           maxSize={30}
           collapsible
@@ -135,7 +135,7 @@ const HomeLayout: FC<IProps> = ({ NoteForm, Preview, History }) => {
                 </Tooltip>
               </TooltipProvider>
             </header>
-            <ScrollArea className="flex-1 overflow-auto">
+            <ScrollArea className="flex-1 overflow-auto [&_[data-slot=scroll-area-viewport]>div]:!block">
               <div>{History}</div>
             </ScrollArea>
           </aside>
@@ -163,7 +163,7 @@ const HomeLayout: FC<IProps> = ({ NoteForm, Preview, History }) => {
         )}
 
         {/* 右边预览 */}
-        <ResizablePanel defaultSize={61} minSize={30}>
+        <ResizablePanel defaultSize={55} minSize={30}>
           <main className="flex h-full flex-col overflow-hidden bg-white p-6">{Preview}</main>
         </ResizablePanel>
       </ResizablePanelGroup>

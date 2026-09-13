@@ -16,6 +16,7 @@ from app.enmus.note_enums import DownloadQuality
 from app.exceptions.note import NoteError
 from app.services.note import NoteGenerator, logger
 from app.services.task_serial_executor import task_serial_executor
+from app.services.library import library, valid_id
 from app.utils.response import ResponseWrapper as R
 from app.utils.url_parser import extract_video_id, normalize_video_url
 from app.validators.video_url_validator import is_supported_video_url
@@ -82,9 +83,15 @@ UPLOAD_DIR = "uploads"
 
 
 def save_note_to_file(task_id: str, note):
+    valid_id(task_id)
     os.makedirs(NOTE_OUTPUT_DIR, exist_ok=True)
-    with open(os.path.join(NOTE_OUTPUT_DIR, f"{task_id}.json"), "w", encoding="utf-8") as f:
+    target = Path(NOTE_OUTPUT_DIR) / f"{task_id}.json"
+    temporary = target.with_suffix(".json.tmp")
+    with temporary.open("w", encoding="utf-8") as f:
         json.dump(asdict(note), f, ensure_ascii=False, indent=2)
+    # 先完整写入再替换，跨设备读取不会遇到半份 JSON。
+    temporary.replace(target)
+    library.save_result(task_id, asdict(note))
 
 
 def _persist_prefetched_transcript(task_id: str, transcript: dict) -> None:
@@ -226,6 +233,8 @@ def generate_note(data: VideoRequest, background_tasks: BackgroundTasks):
             task_id = str(uuid.uuid4())
 
         # 统一先写入 PENDING，表示已进入队列等待串行执行
+        valid_id(task_id)
+        library.save_pending(task_id, data.model_dump(mode="json", exclude={"prefetched_transcript"}))
         NoteGenerator()._update_status(task_id, TaskStatus.PENDING)
 
         # 客户端已经抓好字幕的话，写到转写缓存文件，NoteGenerator 的 cache-hit 逻辑会直接用上
@@ -245,6 +254,10 @@ def generate_note(data: VideoRequest, background_tasks: BackgroundTasks):
 
 @router.get("/task_status/{task_id}")
 def get_task_status(task_id: str):
+    try:
+        valid_id(task_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     status_path = os.path.join(NOTE_OUTPUT_DIR, f"{task_id}.status.json")
     result_path = os.path.join(NOTE_OUTPUT_DIR, f"{task_id}.json")
 

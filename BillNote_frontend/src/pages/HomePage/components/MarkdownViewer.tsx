@@ -339,7 +339,7 @@ const MarkdownViewer: FC<MarkdownViewerProps> = memo(({ status }) => {
   useEffect(() => {
     if (!currentTask) return
 
-    if (!isMultiVersion) {
+    if (!Array.isArray(currentTask.markdown)) {
       setCurrentVerId('') // 清空旧版本 ID
       setModelName(currentTask.formData.model_name)
       setStyle(currentTask.formData.style)
@@ -352,11 +352,14 @@ const MarkdownViewer: FC<MarkdownViewerProps> = memo(({ status }) => {
 
       if (latestVersion) {
         setCurrentVerId(latestVersion.ver_id)
+      } else {
+        setCurrentVerId('')
+        setSelectedContent('')
       }
     }
-  }, [currentTask?.id, taskStatus])
+  }, [currentTask?.id, taskStatus, currentTask?.markdown])
   useEffect(() => {
-    if (!currentTask || !isMultiVersion) return
+    if (!currentTask || !Array.isArray(currentTask.markdown)) return
 
     const currentVer = currentTask.markdown.find(v => v.ver_id === currentVerId)
     if (currentVer) {
@@ -365,7 +368,7 @@ const MarkdownViewer: FC<MarkdownViewerProps> = memo(({ status }) => {
       setCreateTime(currentVer.created_at || '')
       setSelectedContent(currentVer.content)
     }
-  }, [currentVerId, currentTask?.id])
+  }, [currentVerId, currentTask?.id, currentTask?.markdown])
   const handleCopy = async () => {
     try {
       await navigator.clipboard.writeText(selectedContent)

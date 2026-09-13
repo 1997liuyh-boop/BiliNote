@@ -1,6 +1,7 @@
 from app.db.models.models import Model
 from app.db.models.providers import Provider
 from app.db.models.video_tasks import VideoTask
+from app.db.models.library import LibraryNote, LibraryVersion, LibraryCategory, ArchiveJob
 from app.db.engine import get_engine, Base
 
 def init_db():

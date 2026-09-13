@@ -72,7 +72,10 @@ async def lifespan(app: FastAPI):
         logger.exception("[startup FAILED] 后端启动期异常，详见堆栈；容器会退出并由 restart 策略决定是否重试")
         raise
 
+    from app.services.archive_worker import archive_worker
+    archive_worker.start()
     yield
+    archive_worker.stop()
 
 app = create_app(lifespan=lifespan)
 
