@@ -8,7 +8,7 @@ import {
   FormMessage,
 } from '@/components/ui/form.tsx'
 import { useEffect,useState } from 'react'
-import { useForm, useWatch } from 'react-hook-form'
+import { useForm, useWatch, type FieldErrors } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 
@@ -25,7 +25,6 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip.tsx'
 import { Checkbox } from '@/components/ui/checkbox.tsx'
-import { ScrollArea } from '@/components/ui/scroll-area.tsx'
 import { Button } from '@/components/ui/button.tsx'
 import {
   Select,
@@ -37,9 +36,10 @@ import {
 import { Input } from '@/components/ui/input.tsx'
 import { Textarea } from '@/components/ui/textarea.tsx'
 import { noteStyles, noteFormats, videoPlatforms } from '@/constant/note.ts'
-import { fetchModels } from '@/services/model.ts'
 import { useNavigate } from 'react-router-dom'
 import toast from 'react-hot-toast'
+import BilibiliCollection from './BilibiliCollection'
+import type { GenerationOptions } from '@/services/collection'
 
 /* -------------------- 校验 Schema -------------------- */
 /** 用户粘贴的链接常缺协议头（如 bilibili.com/...），无任何 scheme 时自动补 https:// */
@@ -133,12 +133,13 @@ const CheckboxGroup = ({
 /* -------------------- 主组件 -------------------- */
 const NoteForm = () => {
   const navigate = useNavigate();
+  const [collectionBusy, setCollectionBusy] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
   const [uploadSuccess, setUploadSuccess] = useState(false)
   /* ---- 全局状态 ---- */
   const { addPendingTask, currentTaskId, setCurrentTask, getCurrentTask, retryTask } =
     useTaskStore()
-  const { loadEnabledModels, modelList, showFeatureHint, setShowFeatureHint } = useModelStore()
+  const { loadEnabledModels, modelList } = useModelStore()
 
   /* ---- 表单 ---- */
   const form = useForm<NoteFormValues>({
@@ -157,8 +158,13 @@ const NoteForm = () => {
 
   /* ---- 派生状态（只 watch 一次，提高性能） ---- */
   const platform = useWatch({ control: form.control, name: 'platform' }) as string
+  const videoUrl = useWatch({ control: form.control, name: 'video_url' }) || ''
   const videoUnderstandingEnabled = useWatch({ control: form.control, name: 'video_understanding' })
   const editing = currentTask && currentTask.id
+
+  useEffect(() => {
+    setCollectionBusy(false)
+  }, [currentTaskId])
 
   const goModelAdd = () => {
     navigate("/settings/model");
@@ -220,9 +226,24 @@ const NoteForm = () => {
     }
   }
 
+  const getCollectionOptions = async (): Promise<GenerationOptions | null> => {
+    if (!await form.trigger()) {
+      toast.error('请先完善模型、笔记风格等必填项')
+      return null
+    }
+    const values = formSchema.parse(form.getValues())
+    const model = modelList.find(item => item.model_name === values.model_name)
+    if (!model) {
+      toast.error('请选择可用模型')
+      return null
+    }
+    return { ...values, video_url: withScheme(values.video_url || ''), provider_id: model.provider_id }
+  }
+
   const onSubmit = async (values: NoteFormValues) => {
+    if (collectionBusy) return
     console.log('Not even go here')
-    const payload: NoteFormValues = {
+    const payload = {
       ...values,
       video_url:
         values.platform === 'local' ? values.video_url : withScheme(values.video_url || ''),
@@ -238,11 +259,12 @@ const NoteForm = () => {
     try {
       const data = await generateNote(payload)
       addPendingTask(data.task_id, values.platform, payload)
-    } catch (e: any) {
+    } catch (e: unknown) {
+      const detail = e && typeof e === 'object' && 'data' in e ? e.data : null
       // 就绪门禁：本地转写模型还没下载好。后端返回 reason='transcriber_model_not_ready'，
       // 引导用户去「设置 → 音频转写配置」下载，而不是留一个静默失败的任务。
-      if (e?.data?.reason === 'transcriber_model_not_ready') {
-        const downloading = e?.data?.downloading
+      if (detail && typeof detail === 'object' && 'reason' in detail && detail.reason === 'transcriber_model_not_ready') {
+        const downloading = 'downloading' in detail && detail.downloading
         toast.error(
           downloading
             ? '转写模型正在下载中，请稍候再提交'
@@ -272,7 +294,7 @@ const NoteForm = () => {
         <Button
           type="submit"
           className={!editing ? 'w-full' : 'w-2/3' + ' bg-primary'}
-          disabled={generating}
+          disabled={generating || collectionBusy}
         >
           {generating && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
           {label}
@@ -307,7 +329,7 @@ const NoteForm = () => {
               render={({ field }) => (
                 <FormItem>
                   <Select
-                    disabled={!!editing}
+                    disabled={!!editing || collectionBusy}
                     value={field.value}
                     onValueChange={field.onChange}
                     defaultValue={field.value}
@@ -340,16 +362,20 @@ const NoteForm = () => {
                 <FormItem className="flex-1">
                   {platform === 'local' ? (
                     <>
-                      <Input disabled={!!editing} placeholder="请输入本地视频路径" {...field} />
+                      <Input disabled={!!editing || collectionBusy} placeholder="请输入本地视频路径" {...field} />
                     </>
                   ) : (
-                    <Input disabled={!!editing} placeholder="请输入视频网站链接" {...field} />
+                    <Input disabled={!!editing || collectionBusy} placeholder="请输入视频网站链接" {...field} />
                   )}
                   <FormMessage style={{ display: 'none' }} />
                 </FormItem>
               )}
             />
           </div>
+
+          {platform === 'bilibili' && !editing && (
+            <BilibiliCollection key={videoUrl} videoUrl={videoUrl} getOptions={getCollectionOptions} onBusyChange={setCollectionBusy} />
+          )}
 
           <FormField
             control={form.control}
@@ -480,13 +506,13 @@ const NoteForm = () => {
             <FormField
               control={form.control}
               name="video_understanding"
-              render={({ field }) => (
+              render={() => (
                 <FormItem>
                   <div className="flex items-center gap-2">
                     <FormLabel>启用</FormLabel>
                     <Checkbox
                       checked={videoUnderstandingEnabled}
-                      onCheckedChange={v => form.setValue('video_understanding', v)}
+                      onCheckedChange={v => form.setValue('video_understanding', v === true)}
                     />
                   </div>
                   <FormMessage />

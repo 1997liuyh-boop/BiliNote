@@ -104,3 +104,11 @@ def extract_bilibili_p_number(url: str) -> Optional[int]:
             return p_val
 
     return None
+
+
+def bilibili_cache_id(url: str) -> str:
+    """分 P 媒体必须使用独立缓存，避免同一 BV 的字幕和截图串集。"""
+    bvid = extract_video_id(url, "bilibili")
+    if not bvid:
+        raise ValueError("无法识别 B 站视频编号")
+    return f"{bvid}_p{extract_bilibili_p_number(url) or 1}"

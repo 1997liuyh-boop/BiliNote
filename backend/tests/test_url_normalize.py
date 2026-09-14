@@ -50,7 +50,7 @@ def test_video_request_rejects_no_bv():
 
 def test_note_router_request_accepts_watchlater():
     # note.py 里的 VideoRequest 才是 /generate_note 实际使用的请求模型
-    from app.routers.note import VideoRequest as NoteVideoRequest
+    from app.models.video_request import VideoRequest as NoteVideoRequest
 
     req = NoteVideoRequest(
         video_url="https://www.bilibili.com/list/watchlater/?bvid=BV1CPXpBYEui&oid=116294762371214&spm_id_from=333.881.0.0",

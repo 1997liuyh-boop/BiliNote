@@ -110,9 +110,45 @@ class LibraryService:
             if note is None:
                 note = LibraryNote(id=task_id, created_at=now(), updated_at=now(), payload={})
                 db.add(note)
+            previous = note.payload.get("formData", {})
+            if previous.get("collection_title"):
+                form = {**form, "collection_title": previous["collection_title"]}
             note.payload = {**note.payload, "formData": form, "platform": form.get("platform", "")}
             note.status = "PENDING"
             note.updated_at = now()
+
+    def save_collection_pending(self, request_id, form, episodes, collection_title):
+        """整批原子入库；同一提交标识重试只返回原任务，不重复生成。"""
+        namespace = uuid.UUID(request_id)
+        fingerprint = digest([form, [episode["url"] for episode in episodes]])
+        items = [{"task_id": str(uuid.uuid5(namespace, episode["url"])),
+                  "page": episode["page"], "title": f"{collection_title} · P{episode['page']} {episode['title']}",
+                  "url": episode["url"]} for episode in episodes]
+        with self.scan_lock:
+            for attempt in range(2):
+                try:
+                    with self.sessions.begin() as db:
+                        existing = db.scalars(select(LibraryNote).where(
+                            LibraryNote.payload["collectionRequestId"].as_string() == request_id)).all()
+                        if existing:
+                            if ({note.id for note in existing} != {item["task_id"] for item in items} or
+                                    any(note.deleted or note.payload.get("collectionFingerprint") != fingerprint for note in existing)):
+                                raise ValueError("该批次已提交，但参数已变化或笔记已删除；请核对历史后重新提交")
+                            return items, False
+                        for item in items:
+                            db.add(LibraryNote(id=item["task_id"], title=item["title"], status="PENDING",
+                                created_at=now(), updated_at=now(), payload={
+                                    "platform": "bilibili", "collectionFingerprint": fingerprint, "collectionRequestId": request_id,
+                                    "audioMeta": {"title": item["title"], "platform": "bilibili"},
+                                    "formData": {**form, "video_url": item["url"],
+                                                 "collection_request_id": request_id,
+                                                 "collection_title": item["title"]}}))
+                        db.flush()
+                    return items, True
+                except IntegrityError:
+                    # 多进程同时提交时，由数据库主键兜底，重读已经提交的批次。
+                    if attempt:
+                        raise
 
     def save_result(self, task_id, result, created_at=None, stamp=""):
         valid_id(task_id)
@@ -125,6 +161,8 @@ class LibraryService:
                 db.add(note)
             audio = result.get("audio_meta") or result.get("audioMeta") or {}
             form = note.payload.get("formData", {})
+            if form.get("collection_title"):
+                audio = {**audio, "title": form["collection_title"]}
             # 老文件没有生成参数时，从笔记中的来源链接补回可用的信息。
             markdown = result.get("markdown", "")
             source = re.search(r"来源链接[：:]\s*(https?://\S+)", markdown) if isinstance(markdown, str) else None

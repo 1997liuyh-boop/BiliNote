@@ -13,8 +13,12 @@ def safe_name(value):
 
 
 def note_path(note):
-    if note.get("archivePath", "").startswith("BiliNote/笔记/"):
-        return note["archivePath"]
+    path = note.get("archivePath", "")
+    parts = PurePosixPath(path).parts
+    # 同步后沿用用户移动的路径，避免再次入库生成重复文件；写入仍受冲突校验保护。
+    if (path and path.lower().endswith(".md") and not PurePosixPath(path).is_absolute()
+            and "\\" not in path and ":" not in path and not any(part.startswith(".") for part in parts)):
+        return path
     return f"BiliNote/笔记/{safe_name(note['audioMeta']['title'])}--{note['id']}.md"
 
 
@@ -82,7 +86,8 @@ def render_archive(snapshot, organized):
         source = note["formData"].get("video_url", "")
         properties = {"id": f"bilinote-{note['id']}", "title": note["audioMeta"]["title"],
                       "aliases": [note["audioMeta"]["title"]], "tags": clean_tags(value.get("tags", [])),
-                      "category_id": note.get("categoryId"), "source": source,
+                      "category_id": note.get("categoryId"), "category_name": note.get("categoryName", ""),
+                      "bilinote_revision": note.get("revision", ""), "source": source,
                       "created": note["createdAt"], "updated": stamp, "bilinote_managed": True}
         source_body = note["markdown"][0]["content"]
         content = f"# {note['audioMeta']['title']}\n\n" + "\n\n".join(links) + f"\n\n{body}\n"

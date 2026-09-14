@@ -41,3 +41,29 @@ export const createArchiveJob = (noteIds: string[], categoryId?: string) =>
 export const retryArchiveJob = (id: string) => request.post(`/library/archive/jobs/${id}/retry`)
 export const getArchiveConfig = () =>
   request.get<never, { ready: boolean; message: string }>('/library/archive/config', { suppressToast: true })
+
+export interface VaultTree {
+  name: string
+  paths: string[]
+  fileCount: number
+  folderCount: number
+  scannedAt: string
+}
+
+export interface VaultSyncReport {
+  matched: number
+  categorized: number
+  archived: number
+  unverified: number
+  unchanged: number
+  skipped: number
+  conflicts: { path: string; reason: string }[]
+  scannedAt: string
+}
+
+export const getVaultTree = () => request.get<never, VaultTree>('/library/vault/tree', {
+  timeout: 120000, suppressToast: true,
+})
+export const syncVault = () => request.post<never, VaultSyncReport>('/library/vault/sync', {}, {
+  timeout: 300000, suppressToast: true,
+})

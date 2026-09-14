@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Archive, ArrowDownUp, ChevronDown, FolderPlus, Pencil, RefreshCw, Trash } from 'lucide-react'
 import toast from 'react-hot-toast'
+import VaultExplorer from './VaultExplorer'
 import { useTaskStore, type Task } from '@/store/taskStore'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { assignNotes, createArchiveJob, createCategory, deleteCategory, getArchiveConfig,
   listArchiveJobs, listCategories, renameCategory, retryArchiveJob,
   type ArchiveJob, type Category } from '@/services/library'
@@ -23,6 +25,7 @@ export default function LibraryHistory({ onSelect, selectedId }: {
   const [ready, setReady] = useState(false)
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState('all')
+  const [archiveFilter, setArchiveFilter] = useState('all')
   const [sort, setSort] = useState('created-desc')
   const [selected, setSelected] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
@@ -50,19 +53,24 @@ export default function LibraryHistory({ onSelect, selectedId }: {
   const visible = useMemo(() => tasks.filter(task => {
     if (filter === 'uncategorized' && task.categoryId) return false
     if (filter === 'categorized' && !task.categoryId) return false
+    // 待更新表示 Vault 已有旧版本，仍属于已入库；任务排队或失败不代表入库成功。
+    const archived = task.archiveStatus === 'ARCHIVED' || task.archiveStatus === 'OUTDATED'
+    if (archiveFilter === 'archived' && !archived) return false
+    if (archiveFilter === 'unarchived' && archived) return false
     return (task.audioMeta.title || '').toLocaleLowerCase().includes(search.toLocaleLowerCase().trim())
   }).sort((a, b) => {
     const comparison = sort.startsWith('name')
       ? (a.audioMeta.title || '').localeCompare(b.audioMeta.title || '', 'zh-CN', { numeric: true })
       : new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
     return (sort.endsWith('asc') ? comparison : -comparison) || a.id.localeCompare(b.id)
-  }), [tasks, filter, search, sort])
+  }), [tasks, filter, archiveFilter, search, sort])
   const sortedCategories = [...categories].sort((a, b) => {
     const comparison = sort.startsWith('name') ? a.name.localeCompare(b.name, 'zh-CN', { numeric: true })
       : new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
     return sort.endsWith('asc') ? comparison : -comparison
   })
   const unclassified = tasks.filter(task => !task.categoryId).length
+  const archivedCount = tasks.filter(task => task.archiveStatus === 'ARCHIVED' || task.archiveStatus === 'OUTDATED').length
   const allSelected = visible.length > 0 && visible.every(task => selected.includes(task.id))
   const run = async (action: () => Promise<unknown>, message?: string) => {
     if (busy) return
@@ -98,9 +106,17 @@ export default function LibraryHistory({ onSelect, selectedId }: {
         <input type="checkbox" aria-label={`选择 ${task.audioMeta.title || '未命名笔记'}`} checked={selected.includes(task.id)}
           onChange={event => setSelected(ids => event.target.checked ? [...ids, task.id] : ids.filter(id => id !== task.id))}
           className="mt-1 h-4 w-4 shrink-0 accent-primary" />
-        <button onClick={() => onSelect(task.id)} className="min-w-0 flex-1 text-left text-sm font-medium leading-5 text-neutral-900">
-          <span className="line-clamp-2">{task.audioMeta.title || '未命名笔记'}</span>
-        </button>
+        <Tooltip delayDuration={250}>
+          <TooltipTrigger asChild>
+            <button onClick={() => onSelect(task.id)} className="min-w-0 flex-1 rounded text-left text-sm font-medium leading-5 text-neutral-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary">
+              <span className="line-clamp-2">{task.audioMeta.title || '未命名笔记'}</span>
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="top" align="start" sideOffset={6}
+            className="max-h-64 max-w-[min(24rem,calc(100vw-2rem))] overflow-y-auto whitespace-normal break-words text-left leading-5 [overflow-wrap:anywhere]">
+            {task.audioMeta.title || '未命名笔记'}
+          </TooltipContent>
+        </Tooltip>
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] text-neutral-500">
         <span>{new Date(task.createdAt).toLocaleDateString('zh-CN')}</span>
@@ -110,6 +126,7 @@ export default function LibraryHistory({ onSelect, selectedId }: {
         </span>
         {task.status !== 'SUCCESS' && <span>{task.status === 'FAILED' ? '生成失败' : '生成中'}</span>}
       </div>
+      {task.archivePath && <p className="mt-1.5 truncate text-[10px] text-neutral-400" title={task.archivePath}>Vault：{task.archivePath}</p>}
       <div className="mt-2 flex items-center justify-end gap-2">
         <button className={`${control} flex items-center gap-1`} disabled={!ready || busy || task.status !== 'SUCCESS'}
           onClick={() => void archive([task.id])}><Archive size={12} />手动入库</button>
@@ -120,6 +137,7 @@ export default function LibraryHistory({ onSelect, selectedId }: {
   }
 
   return <div className="flex min-w-0 flex-col gap-3 pb-6">
+    <VaultExplorer onSynced={async () => { await Promise.all([syncHistory(), refresh()]) }} />
     <div className="flex gap-2">
       <input aria-label="搜索笔记标题" placeholder="搜索笔记标题…" value={search} onChange={event => setSearch(event.target.value)} className={`${control} min-w-0 flex-1`} />
       <button className={control} aria-label="刷新历史" disabled={busy} onClick={() => void run(async () => {})}><RefreshCw size={14} /></button>
@@ -131,6 +149,13 @@ export default function LibraryHistory({ onSelect, selectedId }: {
         <button key={value} onClick={() => setFilter(value)} aria-pressed={filter === value}
           className={`rounded-full px-2.5 py-1 text-xs ${filter === value ? 'bg-neutral-900 text-white' : 'bg-neutral-100 text-neutral-600'}`}>{label}</button>)}
     </div>
+    <div role="group" aria-label="入库状态筛选" className="flex flex-wrap items-center gap-1">
+      <span className="mr-1 text-xs text-neutral-500">入库状态</span>
+      {([['all', `全部 ${tasks.length}`], ['archived', `已入库 ${archivedCount}`], ['unarchived', `未入库 ${tasks.length - archivedCount}`]]).map(([value, label]) =>
+        <button key={value} onClick={() => { setArchiveFilter(value); setSelected([]) }} aria-pressed={archiveFilter === value}
+          className={`rounded-full px-2.5 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${archiveFilter === value ? 'bg-neutral-900 text-white' : 'bg-neutral-100 text-neutral-600'}`}>{label}</button>)}
+    </div>
+    {archiveFilter !== 'all' && <p className="text-[11px] text-neutral-500">已入库包含待更新的笔记；未入库表示尚无成功入库记录。</p>}
     <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-neutral-500">
       <label className="flex items-center gap-1.5"><input type="checkbox" checked={allSelected} aria-label="全选当前筛选结果"
         onChange={event => setSelected(event.target.checked ? [...new Set([...selected, ...visible.map(task => task.id)])] : selected.filter(id => !visible.some(task => task.id === id)))} />全选</label>
@@ -151,11 +176,11 @@ export default function LibraryHistory({ onSelect, selectedId }: {
     {!ready && <p className="text-[11px] text-neutral-500">入库连接待配置；可以正常归类和查看历史。</p>}
     {filter !== 'uncategorized' && sortedCategories.map(category => {
       const notes = visible.filter(task => task.categoryId === category.id)
-      if (search && !notes.length) return null
+      if ((search.trim() || archiveFilter !== 'all') && !notes.length) return null
       return <details key={category.id} open className="rounded-lg border border-neutral-200 bg-neutral-50">
         <summary className="flex cursor-pointer list-none items-center gap-1.5 p-2.5 text-sm font-medium">
           <ChevronDown size={14} /><span className="min-w-0 flex-1 truncate" title={category.name}>{category.name}</span>
-          <span className="text-xs font-normal text-neutral-500">{category.count}</span>
+          <span className="text-xs font-normal text-neutral-500">{archiveFilter !== 'all' || search.trim() ? `${notes.length} / ${category.count}` : category.count}</span>
         </summary>
         <div className="flex flex-wrap items-center gap-2 px-2.5 pb-2 text-[10px] text-neutral-500">
           <span>{archiveLabels[category.archiveStatus]}</span>

@@ -13,7 +13,7 @@ from app.downloaders.bilibili_subtitle import BilibiliSubtitleFetcher
 from app.models.notes_model import AudioDownloadResult
 from app.models.transcriber_model import TranscriptResult, TranscriptSegment
 from app.utils.path_helper import get_data_dir
-from app.utils.url_parser import extract_video_id
+from app.utils.url_parser import bilibili_cache_id
 from app.services.cookie_manager import CookieConfigManager
 
 logger = logging.getLogger(__name__)
@@ -60,7 +60,8 @@ class BilibiliDownloader(Downloader, ABC):
             output_dir=self.cache_data
         os.makedirs(output_dir, exist_ok=True)
 
-        output_path = os.path.join(output_dir, "%(id)s.%(ext)s")
+        cache_id = bilibili_cache_id(video_url)
+        output_path = os.path.join(output_dir, f"{cache_id}.%(ext)s")
 
         ydl_opts = {
             **YDL_RETRY_OPTS,
@@ -86,7 +87,7 @@ class BilibiliDownloader(Downloader, ABC):
             title = info.get("title")
             duration = info.get("duration", 0)
             cover_url = info.get("thumbnail")
-            audio_path = os.path.join(output_dir, f"{video_id}.mp3")
+            audio_path = os.path.join(output_dir, f"{cache_id}.mp3")
 
         return AudioDownloadResult(
             file_path=audio_path,
@@ -111,16 +112,13 @@ class BilibiliDownloader(Downloader, ABC):
         if output_dir is None:
             output_dir = get_data_dir()
         os.makedirs(output_dir, exist_ok=True)
-        print("video_url",video_url)
-        video_id=extract_video_id(video_url, "bilibili")
-        video_path = os.path.join(output_dir, f"{video_id}.mp4")
+        cache_id = bilibili_cache_id(video_url)
+        video_path = os.path.join(output_dir, f"{cache_id}.mp4")
         if os.path.exists(video_path):
             return video_path
 
-        # 检查是否已经存在
-
-
-        output_path = os.path.join(output_dir, "%(id)s.%(ext)s")
+        # 使用分集缓存名，不复用旧版仅按 BV 保存的文件。
+        output_path = os.path.join(output_dir, f"{cache_id}.%(ext)s")
 
         ydl_opts = {
             **YDL_RETRY_OPTS,
@@ -135,9 +133,7 @@ class BilibiliDownloader(Downloader, ABC):
             ydl_opts['cookiefile'] = self._cookiefile
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=True)
-            video_id = info.get("id")
-            video_path = os.path.join(output_dir, f"{video_id}.mp4")
+            ydl.extract_info(video_url, download=True)
 
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"视频文件未找到: {video_path}")
@@ -182,7 +178,7 @@ class BilibiliDownloader(Downloader, ABC):
         if langs is None:
             langs = ['zh-Hans', 'zh', 'zh-CN', 'ai-zh', 'en', 'en-US']
 
-        video_id = extract_video_id(video_url, "bilibili")
+        video_id = bilibili_cache_id(video_url)
 
         ydl_opts = {
             **YDL_RETRY_OPTS,
@@ -191,6 +187,7 @@ class BilibiliDownloader(Downloader, ABC):
             'subtitleslangs': langs,
             'subtitlesformat': 'srt/json3/best',  # 支持多种格式
             'skip_download': True,
+            'noplaylist': True,
             'outtmpl': os.path.join(output_dir, f'{video_id}.%(ext)s'),
             'quiet': True,
         }

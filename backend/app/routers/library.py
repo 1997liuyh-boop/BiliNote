@@ -1,10 +1,13 @@
 import os
 from typing import Literal
 
+import httpx
+
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.services.library import library
+from app.services.vault import vault
 from app.utils.response import ResponseWrapper as R
 
 router = APIRouter(prefix="/library", tags=["笔记库"])
@@ -106,3 +109,20 @@ def create_archive_job(data: ArchiveRequest):
 @router.post("/archive/jobs/{job_id}/retry")
 def retry_archive_job(job_id: str):
     return perform(library.retry_job, job_id)
+
+
+def perform_vault(action):
+    try:
+        return perform(action)
+    except (OSError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=503, detail="无法读取服务器 Vault，请检查目录挂载、WebDAV 连接和读取权限") from exc
+
+
+@router.get("/vault/tree")
+def vault_tree():
+    return perform_vault(vault.tree)
+
+
+@router.post("/vault/sync")
+def sync_vault():
+    return perform_vault(vault.sync)
