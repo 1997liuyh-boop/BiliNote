@@ -89,6 +89,9 @@ WORKDIR /app/backend
 
 # 复制前端静态文件到 nginx
 COPY --from=frontend-builder /tmp/frontend/dist /usr/share/nginx/html
+# 构建或打包环境可能保留私有目录权限，静态资源必须允许 Nginx 工作进程读取。
+RUN find /usr/share/nginx/html -type d -exec chmod 755 {} + \
+    && find /usr/share/nginx/html -type f -exec chmod 644 {} +
 
 # 配置 nginx（单镜像版：前端静态文件 + 本地 backend 代理，见 nginx/standalone.conf）
 RUN rm -rf /etc/nginx/conf.d/default.conf

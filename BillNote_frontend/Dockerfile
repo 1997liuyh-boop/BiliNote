@@ -32,3 +32,6 @@ COPY ./BillNote_frontend/deploy/default.conf /etc/nginx/conf.d/default.conf
 
 # 拷贝构建产物
 COPY --from=builder /app/dist /usr/share/nginx/html
+# 构建或打包环境可能保留私有目录权限，静态资源必须允许 Nginx 工作进程读取。
+RUN find /usr/share/nginx/html -type d -exec chmod 755 {} + \
+    && find /usr/share/nginx/html -type f -exec chmod 644 {} +
