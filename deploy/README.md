@@ -137,3 +137,52 @@ sudo docker compose --project-directory /opt/bilinote -f /opt/bilinote/compose.y
 ```
 
 旧镜像与旧下载器覆盖文件均已保留。不要还原数据库覆盖发布后新增笔记，不要执行 `down -v`，不要停止入库适配器。选集队列仍为进程内顺序执行，重启不会自动恢复未完成队列。
+
+
+## Hermes Webhook 完成通知（可选启用）
+
+此改造只替换完成通知的发送方式，**不改变 Hermes 整理、WebDAV 发布、回读校验或入库状态逻辑**。原有服务器未配置时继续使用 CLI；代码更新本身不代表生产 Webhook 已启用。
+
+### 配置与兼容性
+
+- 参考官方文档：https://hermes-agent.nousresearch.com/docs/user-guide/messaging/webhooks
+- 适配器环境变量样例：`deploy/bridge-webhook.env.example`。需要合并到 `/opt/hermes/data/bilinote-archive/bridge.env`，不是 BiliNote 应用的 `.env`。
+- Hermes 路由样例：`deploy/hermes-webhook.example.yaml`。将 `platforms.webhook` 合并到现有配置，保留所有模型和其他消息平台设置。
+- `ARCHIVE_NOTIFY_TRANSPORT=webhook` 明确选择新方式；`cli` 为兼容默认值。Webhook 失败不会自动切换 CLI，避免一次任务两次通知。
+- `ARCHIVE_HERMES_WEBHOOK_URL` 必须为 `/webhooks/<route-name>` 地址，不支持查询参数、URL 内嵌凭据、重定向或 profile 前缀。HTTP 仅接受回环地址及内部服务名 `hermes`；其他主机要求 HTTPS，使用系统证书验证。
+- `ARCHIVE_HERMES_WEBHOOK_SECRET` 与该路由的 `secret` 完全一致，在服务器生成独立随机密钥，不复用入库桥接 Token。禁止空密钥和 `INSECURE_NO_AUTH`，不要写进 Git、命令输出或共享日志。
+- 路由必须设置 `deliver_only: true`、`deliver: qqbot`、`prompt: "{message}"`，不要添加 `skills`、`script` 或 `cron_job`。QQ 目标固定在服务器配置中，不从请求载荷动态选择。
+- `deliver_extra.chat_id` 应使用现有 QQ 适配器确认过的会话 ID，不能直接复制完整的 `ARCHIVE_QQ_TARGET=qqbot:...` CLI 目标字符串。沿用同一接收会话，不切换到未确认的默认 home channel。
+
+当前桥接服务通过 `docker exec` 在 Hermes 容器内运行，所以建议 Webhook **仅监听 `127.0.0.1:8644`**；无需宿主机端口映射、腾讯云防火墙规则或公网反向代理。若已有 Webhook 接收其他业务，先检查监听与路由配置，不要直接替换或缩小原服务的监听范围。
+
+### 请求与状态处理
+
+通知载荷只有 `event_type=bilinote.archive.completed`、任务 ID、通知 ID、完成提醒文本，不附带笔记正文、Cookie 或模型密钥。使用 UTF-8 原始 JSON 字节签名：
+
+- `X-Webhook-Signature-V2`：HMAC-SHA256(`<timestamp>.<raw_body>`) 的十六进制值。
+- `X-Webhook-Timestamp`：Unix 秒时间戳；双方系统时钟应同步。
+- `X-Request-ID`：`bilinote-archive-<job_id>`，重试保持一致。
+
+新客户端不读取代理环境变量、不跟随重定向；连接和读操作设置超时，响应最多读取 16 KiB 加一个检测字节，不将第三方错误原文写入任务日志。
+
+| 接收结果 | 本地通知状态 | 后续处理 |
+| --- | --- | --- |
+| HTTP 200，`status=delivered`，route、qqbot target 和 delivery_id 均匹配 | SENT | 持久化成功，后续请求不再发送；这不是用户已读回执 |
+| 连接建立前失败；HTTP 400/401/403/404/405/413/415/422/429；`status=ignored` | FAILED | 排查服务、签名、过滤或限流后，从现有入库任务手动重试 |
+| 请求开始后超时、断连；HTTP 202、502、其他未知响应；`duplicate` 或不匹配回执 | UNKNOWN | 不自动重发，不回退 CLI，先人工核对 QQ 收信和 Hermes 日志 |
+
+Hermes 的 ID 去重缓存只有一小时，且上游在实际发送**之前**记录 ID；所以 `duplicate` 甚至可能对应之前失败的发送。502 也可能源于部分发送后异常，不能一律当作安全重试。BiliNote 持续保存 `notification.json` 和原始 `notification.txt`：同任务复用原文，SENT/SENDING/UNKNOWN 阻止再次发送，服务重启时 SENDING 仍转为 UNKNOWN。UNKNOWN 不能通过切换传输方式或删除记录来“修复”；先核实实际送达情况，再由管理员决定是否需要重新发送，避免破坏去重保护。
+
+### 上线检查与回退
+
+1. 核对生产 Hermes 已安装版本的 `gateway/platforms/webhook.py` 支持 `X-Webhook-Signature-V2`、`deliver_only`、同步 `delivered` 回执及 QQ 投递。只读取代码/版本，不调用通知接口；旧版本不自动降级到无时间戳签名，也不在此次改造中自动升级整个 Hermes。
+2. 确认没有正在整理或通知的任务，备份桥接脚本、`bridge.env` 和 Hermes 配置；保留 jobs 目录和数据库，不覆盖历史状态。
+3. 在服务器私下生成并填写路由密钥、已确认 QQ 会话 ID；合并配置并校验，保留其他路由。先使 Hermes Webhook 服务生效，再更新桥接脚本和环境。若启用平台需要重启 Hermes 网关，应安排短暂消息服务中断窗口。
+4. 只读检查容器内 `GET http://127.0.0.1:8644/health`、监听范围及桥接 systemd 服务状态；health 成功并不证明 QQ 可送达。
+5. 实际发送验收会向现有 QQ 会话发消息，应先确认再用一个真实已完成入库任务验证。不能仅凭 HTTP 200 宣布验收成功，应核对匹配回执、任务 SENT 和 QQ 收信。不批量重试历史任务。
+6. 回退时先确认没有发送中的任务，再将 `ARCHIVE_NOTIFY_TRANSPORT` 改为 `cli`，保留原 `ARCHIVE_QQ_TARGET`，仅重启桥接服务；必要时恢复备份脚本。不要删除通知状态、还原旧数据库或停止整个入库系统。是否撤回 Hermes 新路由应单独核对，不影响其余消息服务。
+
+本地测试仅使用模拟投递和本机 HTTP 接收端，不会调用真实 Hermes、QQ 或模型。覆盖签名原文字节、中文文本、严格回执校验、连接失败与发送中断、限流与 duplicate、并发去重、磁盘去重、重试复用原文、旧 CLI 兼容及通知失败不重复整理/发布。
+
+2026-09-14 本次本地回归：Webhook、入库流水线、历史库、Vault 和分集相关测试共 **153 passed**（2 条依赖弃用警告）；未执行生产配置切换，也未发送真实 QQ 验收消息。

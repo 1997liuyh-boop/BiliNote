@@ -1,6 +1,7 @@
 """在 Hermes 容器中运行的入库适配器，复用已有模型及 QQ 配置。"""
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import re
@@ -11,11 +12,12 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 VAULT = Path(os.getenv("ARCHIVE_VAULT_PATH", "/obsidian-vault")).resolve()
 STATE = Path(os.getenv("ARCHIVE_BRIDGE_STATE", "/opt/data/bilinote-archive/jobs"))
 TOKEN = os.environ["ARCHIVE_BRIDGE_TOKEN"]
-TARGET = os.environ["ARCHIVE_QQ_TARGET"]
+TARGET = os.getenv("ARCHIVE_QQ_TARGET", "")
 HERMES = Path(os.getenv("ARCHIVE_HERMES_ROOT", "/opt/hermes"))
 LOCK = threading.RLock()
 
@@ -141,6 +143,119 @@ def delivery_result(result):
     return {"status": "UNKNOWN" if result.returncode == 0 else "FAILED", "error": "无法确认 QQ 送达结果，请先检查是否收到提醒"}
 
 
+def notification_config():
+    # 保持旧部署兼容；显式启用 Webhook 后绝不自动回退到 CLI，避免双发。
+    transport = os.getenv("ARCHIVE_NOTIFY_TRANSPORT", "cli").strip().lower()
+    if transport == "cli":
+        if not TARGET:
+            raise ValueError("CLI 通知缺少 ARCHIVE_QQ_TARGET")
+        return transport, None, None
+    if transport != "webhook":
+        raise ValueError("ARCHIVE_NOTIFY_TRANSPORT 仅支持 cli 或 webhook")
+    raw_url = os.getenv("ARCHIVE_HERMES_WEBHOOK_URL", "")
+    secret = os.getenv("ARCHIVE_HERMES_WEBHOOK_SECRET", "")
+    url = urlsplit(raw_url)
+    if (url.scheme not in ("http", "https") or not url.hostname or url.username is not None
+            or url.password is not None or url.query or url.fragment
+            or any(char.isspace() for char in raw_url)
+            or not re.fullmatch(r"/webhooks/[A-Za-z0-9_-]+", url.path)):
+        raise ValueError("Webhook 地址必须是无认证信息、查询参数的 /webhooks/路由名 地址")
+    if url.scheme == "http" and url.hostname not in ("127.0.0.1", "localhost", "::1", "hermes"):
+        raise ValueError("明文 Webhook 仅允许本机或 Hermes 内网服务，其他地址必须使用 HTTPS")
+    if not secret.strip() or secret == "INSECURE_NO_AUTH":
+        raise ValueError("Webhook 必须配置有效的 HMAC 密钥")
+    # 提前验证端口，错误配置不得进入发送中状态。
+    if url.port == 0:
+        raise ValueError("Webhook 端口无效")
+    return transport, url, secret
+
+
+def webhook_result(status, raw, route, delivery_id):
+    # 不保存第三方响应原文，避免错误页、密钥或内部配置进入任务记录。
+    if status in (400, 401, 403, 404, 405, 413, 415, 422, 429):
+        return {"status": "FAILED", "error": f"Webhook 拒绝请求（HTTP {status}），请检查配置后重试"}
+    unknown = {"status": "UNKNOWN", "error": "无法确认 Webhook 的 QQ 送达结果，请先核对收信及 Hermes 日志，勿直接重发"}
+    if status != 200 or len(raw) > 16384:
+        return unknown
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeError):
+        return unknown
+    if not isinstance(value, dict):
+        return unknown
+    if (value.get("status") == "delivered" and value.get("route") == route
+            and value.get("target") == "qqbot" and value.get("delivery_id") == delivery_id):
+        return {"status": "SENT"}
+    if value.get("status") == "ignored":
+        return {"status": "FAILED", "error": "Webhook 事件被过滤，请检查路由 events 和 filters 后重试"}
+    # duplicate 仅表示接收过请求；Hermes 在发送前记录 ID，不能据此确认送达。
+    # 202 或 502 也可能已触发模型或部分发送，统一阻止自动重发。
+    return unknown
+
+
+def send_webhook(job_id, message, url, secret):
+    delivery_id = f"bilinote-archive-{job_id}"
+    body = json.dumps({"event_type": "bilinote.archive.completed", "job_id": job_id,
+                       "delivery_id": delivery_id, "message": message},
+                      ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    timestamp = str(int(time.time()))
+    signature = hmac.new(secret.encode("utf-8"), timestamp.encode() + b"." + body, hashlib.sha256).hexdigest()
+    headers = {"Content-Type": "application/json; charset=utf-8", "X-Request-ID": delivery_id,
+               "X-Webhook-Timestamp": timestamp, "X-Webhook-Signature-V2": signature}
+    connection_type = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
+    connection = connection_type(url.hostname, url.port, timeout=10)
+    started = False
+    try:
+        # 直连且不跟随重定向、不读取代理环境变量，避免向其他地址泄露消息。
+        connection.connect()
+        started = True
+        connection.request("POST", url.path, body=body, headers=headers)
+        response = connection.getresponse()
+        raw = response.read(16385)
+        return webhook_result(response.status, raw, url.path.rsplit("/", 1)[-1], delivery_id)
+    except (OSError, http.client.HTTPException):
+        if not started:
+            return {"status": "FAILED", "error": "无法连接 Hermes Webhook，请检查服务后重试"}
+        return {"status": "UNKNOWN", "error": "Webhook 请求已开始但响应中断，请先确认 QQ 是否收到，避免重复通知"}
+    finally:
+        connection.close()
+
+
+def notify(job_id, message):
+    if not isinstance(message, str) or not message.strip() or len(message.encode("utf-8")) > 12000:
+        raise ValueError("通知内容无效或过长")
+    job_dir = folder(job_id)
+    notification_path = job_dir / "notification.json"
+    with LOCK:
+        if load(job_dir / "state.json", {}).get("status") != "COMPLETED":
+            raise ValueError("整理尚未完成，不能发送完成通知")
+        previous = load(notification_path)
+        if previous and previous["status"] in ("SENT", "SENDING", "UNKNOWN"):
+            return previous
+        transport, url, secret = notification_config()
+        message_path = job_dir / "notification.txt"
+        # 同一任务重试复用原文和 ID，不能偷偷改变已经提交过的通知。
+        if message_path.exists():
+            message = message_path.read_text(encoding="utf-8")
+        else:
+            message_path.write_text(message, encoding="utf-8")
+        save(notification_path, {"status": "SENDING", "transport": transport})
+    try:
+        if transport == "webhook":
+            notification = send_webhook(job_id, message, url, secret)
+        else:
+            result = subprocess.run([sys.executable, "-m", "hermes_cli.main", "send", "--to", TARGET,
+                "--file", str(message_path), "--json"], cwd=HERMES, capture_output=True, timeout=45)
+            notification = delivery_result(result)
+    except Exception:
+        # 无法确定异常发生在发送前还是发送后时，宁可人工核验也不双发。
+        notification = {"status": "UNKNOWN", "error": "通知发送异常，请先确认 QQ 是否收到，避免重复通知"}
+    notification["transport"] = transport
+    with LOCK:
+        save(notification_path, notification)
+    return notification
+
+
 def organize(job_id):
     job_dir = folder(job_id)
     manifest = load(VAULT / ".bilinote-inbox" / job_id / "manifest.json")
@@ -247,26 +362,7 @@ class Handler(BaseHTTPRequestHandler):
                     save(job_dir / "state.json", state)
                 return self.reply({"status": state["status"]}, 202)
             if self.path.startswith("/jobs/") and self.path.endswith("/notify"):
-                job_dir = folder(self.path.split("/")[2])
-                if load(job_dir / "state.json", {}).get("status") != "COMPLETED":
-                    raise ValueError("整理尚未完成，不能发送完成通知")
-                notification_path = job_dir / "notification.json"
-                with LOCK:
-                    notification = load(notification_path)
-                    if notification and notification["status"] in ("SENT", "SENDING", "UNKNOWN"):
-                        return self.reply(notification)
-                    save(notification_path, {"status": "SENDING"})
-                message_path = job_dir / "notification.txt"
-                message_path.write_text(data["message"], encoding="utf-8")
-                try:
-                    result = subprocess.run([sys.executable, "-m", "hermes_cli.main", "send", "--to", TARGET,
-                        "--file", str(message_path), "--json"], cwd=HERMES, capture_output=True, timeout=45)
-                    notification = delivery_result(result)
-                except subprocess.TimeoutExpired:
-                    notification = {"status": "UNKNOWN", "error": "QQ 发送超时，送达状态不确定，请先确认是否收到，避免重复提醒"}
-                with LOCK:
-                    save(notification_path, notification)
-                return self.reply(notification)
+                return self.reply(notify(self.path.split("/")[2], data["message"]))
             return self.reply({"error": "接口不存在"}, 404)
         except (ValueError, KeyError, OSError):
             return self.reply({"error": "请求或入库清单无效"}, 400)
@@ -281,6 +377,7 @@ if __name__ == "__main__":
             if command.exists() and b'archive_bridge.py' in command.read_bytes():
                 os.kill(pid, 15)
         sys.exit(0)
+    notification_config()
     STATE.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(os.getpid()))
     # 重启时恢复整理任务；发送中断时保留未知状态，避免重复通知。

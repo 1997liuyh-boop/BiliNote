@@ -165,3 +165,28 @@ def test_unknown_backlink_blocks_publication(pipeline):
     worker.tick()
     assert "BiliNote/总览.md" not in dav.files
     assert not any(path.endswith("/notify") for _, path in calls)
+
+
+def test_unknown_notification_keeps_published_notes_and_does_not_repeat_publish(pipeline, monkeypatch):
+    library, worker, dav, job, calls, _ = pipeline
+    original = worker.bridge
+    notify_calls = []
+    def bridge(method, path, payload=None):
+        if path.endswith("/notify"):
+            notify_calls.append(path)
+            return {"status": "UNKNOWN", "error": "请先确认 QQ 是否收到"}
+        return original(method, path, payload)
+    monkeypatch.setattr(worker, "bridge", bridge)
+    for _ in range(4):
+        worker.tick()
+    state = library.list_jobs()[0]
+    assert state["stage"] == "NOTIFY" and state["status"] == "FAILED"
+    assert state["notification"] == "UNKNOWN"
+    assert library.detail("note-a")["archiveStatus"] == "ARCHIVED"
+    files = dict(dav.files)
+    before = list(calls)
+    library.retry_job(job["id"])
+    worker.tick()
+    assert dav.files == files and calls == before
+    assert len(notify_calls) == 2
+    assert library.list_jobs()[0]["notification"] == "UNKNOWN"

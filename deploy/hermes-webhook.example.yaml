@@ -1,0 +1,20 @@
+# 将本节合并到 Hermes 的现有 config.yaml，不要覆盖其他平台或模型配置。
+# 启用前核对已安装版本支持 Generic V2 签名、deliver_only 和 qqbot。
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      # 入库适配器与 Hermes 在同一容器内运行，只监听回环地址。
+      host: 127.0.0.1
+      port: 8644
+      routes:
+        bilinote-archive:
+          # 在服务器上填入随机密钥，与 bridge.env 中的密钥一致，不要提交真实值。
+          secret: "REPLACE_WITH_PRIVATE_RANDOM_SECRET"
+          events: ["bilinote.archive.completed"]
+          deliver_only: true
+          deliver: qqbot
+          prompt: "{message}"
+          deliver_extra:
+            # 填 Hermes QQ 适配器已确认会话的 chat_id，不是完整的 CLI --to 字符串。
+            chat_id: "REPLACE_WITH_CONFIRMED_QQ_CHAT_ID"
