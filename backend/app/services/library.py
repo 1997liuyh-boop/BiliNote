@@ -48,7 +48,8 @@ def note_fingerprint(note):
 def job_dict(job):
     return {"id": job.id, "scope": job.scope, "category_id": job.category_id,
             "status": job.status, "stage": job.stage, "error": job.error,
-            "notification": job.notification, "createdAt": job.created_at,
+            "notification": job.notification, "failureNotification": job.result.get("failureNotification"),
+            "createdAt": job.created_at,
             "updatedAt": job.updated_at, "snapshot": job.snapshot, "result": job.result}
 
 
@@ -249,7 +250,27 @@ class LibraryService:
                 except (ValueError, OSError, AttributeError):
                     logger.warning("跳过无法读取的状态文件：%s", path.name)
 
-    def serialize(self, db, note, full=False):
+    def latest_archive_jobs(self, db, note_ids):
+        # 从全部任务中按创建时间选取每篇笔记的最新任务，不受“最近任务”展示上限影响。
+        remaining, latest = set(note_ids), {}
+        if not remaining:
+            return latest
+        rows = db.execute(select(ArchiveJob.id, ArchiveJob.status, ArchiveJob.stage, ArchiveJob.snapshot)
+                          .order_by(ArchiveJob.created_at.desc(), ArchiveJob.id.desc())
+                          .execution_options(yield_per=100))
+        try:
+            for row in rows:
+                for note in row.snapshot.get("notes", []):
+                    if note["id"] in remaining:
+                        latest[note["id"]] = {"id": row.id, "status": row.status, "stage": row.stage}
+                        remaining.remove(note["id"])
+                if not remaining:
+                    break
+        finally:
+            rows.close()
+        return latest
+
+    def serialize(self, db, note, full=False, archive_job=None):
         payload = note.payload
         audio = payload.get("audioMeta") or {}
         archive_status = "UNARCHIVED"
@@ -257,7 +278,7 @@ class LibraryService:
             archive_status = "ARCHIVED" if note.archived_hash == note_fingerprint(note) else "OUTDATED"
         data = {"id": note.id, "status": note.status, "createdAt": note.created_at,
                 "updatedAt": note.updated_at, "categoryId": note.category_id,
-                "archiveStatus": archive_status, "archivePath": note.archived_path,
+                "archiveStatus": archive_status, "archivePath": note.archived_path, "archiveJob": archive_job,
                 "revision": note.content_hash, "platform": payload.get("platform", ""),
                 "audioMeta": {**{key: audio.get(key, "") for key in ("cover_url", "platform", "video_id", "file_path")},
                               "title": note.title, "duration": audio.get("duration", 0), "raw_info": None},
@@ -286,12 +307,15 @@ class LibraryService:
             total = db.scalar(select(func.count()).select_from(query.subquery()))
             order = LibraryNote.title if sort == "name" else LibraryNote.created_at
             query = query.order_by(order.asc() if direction == "asc" else order.desc(), LibraryNote.id)
-            return {"items": [self.serialize(db, n) for n in db.scalars(query.offset(offset).limit(limit))], "total": total}
+            notes = list(db.scalars(query.offset(offset).limit(limit)))
+            jobs = self.latest_archive_jobs(db, [note.id for note in notes])
+            return {"items": [self.serialize(db, n, archive_job=jobs.get(n.id)) for n in notes], "total": total}
 
     def detail(self, note_id):
         self.refresh_files()
         with self.sessions() as db:
-            return self.serialize(db, self.require_note(db, note_id), full=True)
+            return self.serialize(db, self.require_note(db, note_id), full=True,
+                                  archive_job=self.latest_archive_jobs(db, [note_id]).get(note_id))
 
     def delete_note(self, note_id):
         with self.sessions.begin() as db:

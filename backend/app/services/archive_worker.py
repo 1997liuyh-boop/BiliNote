@@ -71,18 +71,47 @@ class ArchiveWorker:
             response.raise_for_status()
             return response.json()
 
+    def notify_failure(self, job_id, snapshot, result):
+        failure = result["failureNotification"]
+        label = snapshot["category"]["name"] if snapshot.get("category") else "所选笔记"
+        titles = "、".join(note["audioMeta"]["title"][:80] for note in snapshot["notes"][:3])
+        stage_label = {"UPLOAD": "上传文件", "HERMES": "Hermes 整理", "PUBLISH": "写入 Obsidian"}.get(failure["stage"], failure["stage"])
+        message = (f"BiliNote 入库失败：{label}，共 {len(snapshot['notes'])} 条笔记。\n"
+                   f"笔记：{titles}\n失败阶段：{stage_label}\n原因：{failure['reason'][:500]}\n"
+                   f"任务：{job_id}\n请在生成历史的入库任务中处理原因后重试；本次入库未全部完成。")
+        try:
+            state = self.bridge("POST", f"/jobs/{job_id}/notify", {
+                "message": message, "event": "failed", "attempt": failure["attempt"]})
+            status = state.get("status", "UNKNOWN")
+            if status not in ("SENT", "FAILED", "UNKNOWN", "SENDING"):
+                status = "UNKNOWN"
+        except Exception:
+            # 桥接请求可能已经送出，保留未知状态，不能自动重复发送。
+            status = "UNKNOWN"
+            logger.warning("入库失败通知 %s 无法确认送达", job_id)
+        self.update(job_id, result={**result, "failureNotification": {**failure, "status": status}})
+
     def tick(self):
         if not all(os.getenv(key) for key in ("ARCHIVE_BRIDGE_URL", "ARCHIVE_BRIDGE_TOKEN", "WEBDAV_URL", "WEBDAV_USERNAME", "WEBDAV_PASSWORD")):
+            return
+        with self.library.sessions() as db:
+            # 先补发已经持久化但尚未开始发送的失败事件，重启后仍可恢复。
+            pending = next((job for job in db.scalars(select(ArchiveJob).where(ArchiveJob.status == "FAILED"))
+                            if job.result.get("failureNotification", {}).get("status") == "PENDING"), None)
+            pending_data = (pending.id, pending.snapshot, pending.result) if pending else None
+        if pending_data:
+            self.notify_failure(*pending_data)
             return
         with self.library.sessions() as db:
             job = db.scalar(select(ArchiveJob).where(ArchiveJob.status.in_(["QUEUED", "RUNNING"]))
                             .order_by(ArchiveJob.created_at).limit(1))
             if not job:
                 return
-            job_id, stage, snapshot, result = job.id, job.stage, job.snapshot, job.result
+            job_id, stage, snapshot, result, attempt = job.id, job.stage, job.snapshot, job.result, job.attempts
         self.update(job_id, status="RUNNING")
-        dav = WebDAV(os.environ["WEBDAV_URL"], os.environ["WEBDAV_USERNAME"], os.environ["WEBDAV_PASSWORD"])
+        dav = None
         try:
+            dav = WebDAV(os.environ["WEBDAV_URL"], os.environ["WEBDAV_USERNAME"], os.environ["WEBDAV_PASSWORD"])
             if stage == "UPLOAD":
                 dav.put(f".bilinote-inbox/{job_id}/manifest.json", json.dumps(snapshot, ensure_ascii=False).encode())
                 self.bridge("POST", "/jobs", {"id": job_id})
@@ -112,10 +141,18 @@ class ArchiveWorker:
                 self.update(job_id, status="COMPLETED", notification="SENT")
         except Exception as exc:
             message = str(exc) if isinstance(exc, ValueError) else f"{stage} 步骤连接失败，请检查服务后重试"
-            self.update(job_id, status="FAILED", error=message)
+            if stage != "NOTIFY":
+                result = {**result, "failureNotification": {"status": "PENDING", "attempt": attempt,
+                          "stage": stage, "reason": message}}
+                self.update(job_id, status="FAILED", error=message, result=result)
+                self.notify_failure(job_id, snapshot, result)
+            else:
+                # 文件已发布成功，仅完成通知失败时不能发送“入库失败”。
+                self.update(job_id, status="FAILED", error=message)
             logger.warning("入库任务 %s 在 %s 阶段失败：%s", job_id, stage, type(exc).__name__)
         finally:
-            dav.close()
+            if dav is not None:
+                dav.close()
 
     def attachments(self, dav, job_id, path, content):
         static_root = Path("static").resolve()

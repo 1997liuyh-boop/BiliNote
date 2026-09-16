@@ -17,6 +17,7 @@ export interface ArchiveJob {
   status: string
   stage: string
   error: string
+  failureNotification?: { status: string; stage: string; reason: string; attempt: number } | null
   notification: string
   createdAt: string
   snapshot: { category: { name: string } | null; notes: { id: string; title: string }[] }

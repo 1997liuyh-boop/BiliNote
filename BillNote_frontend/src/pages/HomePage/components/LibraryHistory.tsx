@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Archive, ArrowDownUp, ChevronDown, FolderPlus, Pencil, RefreshCw, Trash } from 'lucide-react'
 import toast from 'react-hot-toast'
 import VaultExplorer from './VaultExplorer'
+import { getArchiveState, matchesArchiveFilter } from './archiveState'
 import { useTaskStore, type Task } from '@/store/taskStore'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -10,6 +11,8 @@ import { assignNotes, createArchiveJob, createCategory, deleteCategory, getArchi
   type ArchiveJob, type Category } from '@/services/library'
 
 const control = 'rounded-md border border-neutral-200 bg-white px-2 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-40'
+const notificationLabels: Record<string, string> = { SENT: '已送达', FAILED: '发送失败', PENDING: '待发送',
+  UNKNOWN: '送达状态未确认，请先核对收信', SENDING: '发送中，请勿重复发送' }
 const archiveLabels: Record<string, string> = { UNARCHIVED: '未入库', ARCHIVED: '已入库', OUTDATED: '待更新',
   QUEUED: '排队中', RUNNING: '整理中', FAILED: '入库失败', COMPLETED: '已入库' }
 
@@ -33,30 +36,27 @@ export default function LibraryHistory({ onSelect, selectedId }: {
   const [name, setName] = useState('')
 
   const refresh = async () => {
-    const [nextCategories, nextJobs, config] = await Promise.all([listCategories(), listArchiveJobs(), getArchiveConfig()])
+    const [nextCategories, nextJobs, config] = await Promise.all([listCategories(), listArchiveJobs(), getArchiveConfig(), syncHistory()])
     setCategories(nextCategories); setJobs(nextJobs); setReady(config.ready)
   }
   useEffect(() => {
     let active = true
     const update = async () => {
       try {
-        const [nextCategories, nextJobs, config] = await Promise.all([listCategories(), listArchiveJobs(), getArchiveConfig()])
+        const [nextCategories, nextJobs, config] = await Promise.all([listCategories(), listArchiveJobs(), getArchiveConfig(), syncHistory()])
         if (active) { setCategories(nextCategories); setJobs(nextJobs); setReady(config.ready) }
       } catch { /* 保留已加载的分类，历史区域显示同步失败提示。 */ }
     }
     void update()
     const timer = window.setInterval(update, 5000)
     return () => { active = false; clearInterval(timer) }
-  }, [])
+  }, [syncHistory])
   useEffect(() => { setSelected(ids => ids.filter(id => tasks.some(task => task.id === id))) }, [tasks])
 
   const visible = useMemo(() => tasks.filter(task => {
     if (filter === 'uncategorized' && task.categoryId) return false
     if (filter === 'categorized' && !task.categoryId) return false
-    // 待更新表示 Vault 已有旧版本，仍属于已入库；任务排队或失败不代表入库成功。
-    const archived = task.archiveStatus === 'ARCHIVED' || task.archiveStatus === 'OUTDATED'
-    if (archiveFilter === 'archived' && !archived) return false
-    if (archiveFilter === 'unarchived' && archived) return false
+    if (!matchesArchiveFilter(task, archiveFilter)) return false
     return (task.audioMeta.title || '').toLocaleLowerCase().includes(search.toLocaleLowerCase().trim())
   }).sort((a, b) => {
     const comparison = sort.startsWith('name')
@@ -70,7 +70,9 @@ export default function LibraryHistory({ onSelect, selectedId }: {
     return sort.endsWith('asc') ? comparison : -comparison
   })
   const unclassified = tasks.filter(task => !task.categoryId).length
-  const archivedCount = tasks.filter(task => task.archiveStatus === 'ARCHIVED' || task.archiveStatus === 'OUTDATED').length
+  const archivedCount = tasks.filter(task => matchesArchiveFilter(task, 'archived')).length
+  const archivingCount = tasks.filter(task => matchesArchiveFilter(task, 'archiving')).length
+  const archiveFailedCount = tasks.filter(task => matchesArchiveFilter(task, 'failed')).length
   const allSelected = visible.length > 0 && visible.every(task => selected.includes(task.id))
   const run = async (action: () => Promise<unknown>, message?: string) => {
     if (busy) return
@@ -98,9 +100,7 @@ export default function LibraryHistory({ onSelect, selectedId }: {
   }, '分类已保存')
 
   const renderNote = (task: Task) => {
-    const job = jobs.find(item => item.snapshot.notes.some(note => note.id === task.id))
-    const archiveState = job && ['QUEUED', 'RUNNING', 'FAILED'].includes(job.status)
-      ? job.status : task.archiveStatus || 'UNARCHIVED'
+    const archiveState = getArchiveState(task)
     return <div key={task.id} className={`rounded-lg border p-2.5 ${selectedId === task.id ? 'border-primary bg-primary-light' : 'border-neutral-200 bg-white'}`}>
       <div className="flex items-start gap-2">
         <input type="checkbox" aria-label={`选择 ${task.audioMeta.title || '未命名笔记'}`} checked={selected.includes(task.id)}
@@ -151,11 +151,12 @@ export default function LibraryHistory({ onSelect, selectedId }: {
     </div>
     <div role="group" aria-label="入库状态筛选" className="flex flex-wrap items-center gap-1">
       <span className="mr-1 text-xs text-neutral-500">入库状态</span>
-      {([['all', `全部 ${tasks.length}`], ['archived', `已入库 ${archivedCount}`], ['unarchived', `未入库 ${tasks.length - archivedCount}`]]).map(([value, label]) =>
+      {([['all', `全部 ${tasks.length}`], ['archived', `已入库 ${archivedCount}`], ['unarchived', `未入库 ${tasks.length - archivedCount}`],
+        ['archiving', `入库中 ${archivingCount}`], ['failed', `入库失败 ${archiveFailedCount}`]]).map(([value, label]) =>
         <button key={value} onClick={() => { setArchiveFilter(value); setSelected([]) }} aria-pressed={archiveFilter === value}
           className={`rounded-full px-2.5 py-1 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary ${archiveFilter === value ? 'bg-neutral-900 text-white' : 'bg-neutral-100 text-neutral-600'}`}>{label}</button>)}
     </div>
-    {archiveFilter !== 'all' && <p className="text-[11px] text-neutral-500">已入库包含待更新的笔记；未入库表示尚无成功入库记录。</p>}
+    {archiveFilter !== 'all' && <p className="text-[11px] text-neutral-500">已入库包含待更新；未入库表示尚无成功入库记录。入库中包含排队和整理；入库失败不包含通知失败，可能与已入库旧版本重叠。</p>}
     <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-neutral-500">
       <label className="flex items-center gap-1.5"><input type="checkbox" checked={allSelected} aria-label="全选当前筛选结果"
         onChange={event => setSelected(event.target.checked ? [...new Set([...selected, ...visible.map(task => task.id)])] : selected.filter(id => !visible.some(task => task.id === id)))} />全选</label>
@@ -201,9 +202,12 @@ export default function LibraryHistory({ onSelect, selectedId }: {
     {jobs.length > 0 && <details className="border-t border-neutral-200 pt-3">
       <summary className="cursor-pointer text-xs font-medium">最近入库任务</summary>
       <div className="mt-2 flex flex-col gap-2">{jobs.slice(0, 10).map(job => <div key={job.id} className="rounded bg-neutral-50 p-2 text-xs">
-        <p>{job.snapshot.category?.name || `${job.snapshot.notes.length} 条笔记`} · {archiveLabels[job.status] || job.status}</p>
+        <p>{job.snapshot.category?.name || `${job.snapshot.notes.length} 条笔记`} · {job.stage === 'NOTIFY' && job.status === 'FAILED' ? '已入库，通知失败' : archiveLabels[job.status] || job.status}</p>
         {job.error && <p className="mt-1 break-words text-red-600">{job.error}</p>}
-        {job.notification === 'FAILED' && <p className="text-amber-700">整理完成，QQ 通知发送失败</p>}
+        {job.stage === 'NOTIFY' && ['FAILED', 'UNKNOWN', 'SENDING'].includes(job.notification) &&
+          <p className="text-amber-700">完成通知{job.notification === 'FAILED' ? '发送失败' : '送达状态未确认，请先核对收信'}</p>}
+        {job.status === 'FAILED' && job.stage !== 'NOTIFY' && job.failureNotification &&
+          <p className="text-amber-700">失败通知：{notificationLabels[job.failureNotification.status] || '状态未知'}</p>}
         {job.status === 'FAILED' && <button className={`${control} mt-1`} disabled={busy} onClick={() => void run(() => retryArchiveJob(job.id))}>重试</button>}
       </div>)}</div>
     </details>}

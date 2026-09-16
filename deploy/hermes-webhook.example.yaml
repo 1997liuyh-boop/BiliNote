@@ -11,7 +11,7 @@ platforms:
         bilinote-archive:
           # 在服务器上填入随机密钥，与 bridge.env 中的密钥一致，不要提交真实值。
           secret: "REPLACE_WITH_PRIVATE_RANDOM_SECRET"
-          events: ["bilinote.archive.completed"]
+          events: ["bilinote.archive.completed", "bilinote.archive.failed"]
           deliver_only: true
           deliver: qqbot
           prompt: "{message}"

@@ -51,7 +51,8 @@ def pipeline(tmp_path, monkeypatch):
     def bridge(method, path, payload=None):
         calls.append((method, path))
         if path.endswith("/notify"):
-            assert "BiliNote/总览.md" in dav.files
+            if payload.get("event") != "failed":
+                assert "BiliNote/总览.md" in dav.files
             return {"status": "SENT"}
         return {"status": "COMPLETED", "result": organized} if method == "GET" else {"status": "QUEUED"}
     monkeypatch.setattr(worker, "bridge", bridge)
@@ -87,7 +88,7 @@ def test_user_edits_survive_rearchive(pipeline):
         worker.tick()
     assert "用户新增的内容" in dav.files[path].decode()
     assert library.list_jobs()[0]["status"] == "FAILED"
-    assert sum(path.endswith("/notify") for _, path in calls) == 1
+    assert sum(path.endswith("/notify") for _, path in calls) == 2
 
 
 def test_incomplete_hermes_output_does_not_publish(pipeline):
@@ -97,7 +98,8 @@ def test_incomplete_hermes_output_does_not_publish(pipeline):
     worker.tick()
     assert library.list_jobs()[0]["status"] == "FAILED"
     assert "BiliNote/总览.md" not in dav.files
-    assert not any(path.endswith("/notify") for _, path in calls)
+    assert sum(path.endswith("/notify") for _, path in calls) == 1
+    assert worker.library.list_jobs()[0]["failureNotification"]["status"] == "SENT"
 
 
 def test_notification_retry_does_not_repeat_hermes(pipeline, monkeypatch):
@@ -164,7 +166,8 @@ def test_unknown_backlink_blocks_publication(pipeline):
     worker.tick()
     worker.tick()
     assert "BiliNote/总览.md" not in dav.files
-    assert not any(path.endswith("/notify") for _, path in calls)
+    assert sum(path.endswith("/notify") for _, path in calls) == 1
+    assert worker.library.list_jobs()[0]["failureNotification"]["status"] == "SENT"
 
 
 def test_unknown_notification_keeps_published_notes_and_does_not_repeat_publish(pipeline, monkeypatch):
@@ -190,3 +193,140 @@ def test_unknown_notification_keeps_published_notes_and_does_not_repeat_publish(
     assert dav.files == files and calls == before
     assert len(notify_calls) == 2
     assert library.list_jobs()[0]["notification"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize("stage", ["UPLOAD", "HERMES", "PUBLISH"])
+def test_archive_failure_sends_separate_event_and_keeps_failed_status(pipeline, monkeypatch, stage):
+    library, worker, dav, job, calls, _ = pipeline
+    original = worker.bridge
+    sent = []
+    def bridge(method, path, payload=None):
+        if path.endswith("/notify"):
+            sent.append(payload)
+            return {"status": "SENT"}
+        if stage == "HERMES" and method == "GET":
+            return {"status": "FAILED", "error": "模型整理失败"}
+        return original(method, path, payload)
+    monkeypatch.setattr(worker, "bridge", bridge)
+    if stage == "UPLOAD":
+        monkeypatch.setattr(dav, "put", lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("private-secret")))
+    elif stage == "PUBLISH":
+        monkeypatch.setattr(worker, "publish", lambda *args: (_ for _ in ()).throw(ValueError("文件冲突")))
+    for _ in range(5):
+        worker.tick()
+    state = library.list_jobs()[0]
+    assert state["status"] == "FAILED" and state["stage"] == stage
+    assert state["failureNotification"]["status"] == "SENT"
+    assert len(sent) == 1 and sent[0]["event"] == "failed" and sent[0]["attempt"] == 0
+    assert "入库失败" in sent[0]["message"] and job["id"] in sent[0]["message"]
+    assert "private-secret" not in sent[0]["message"]
+    assert library.detail("note-a")["archiveStatus"] == "UNARCHIVED"
+
+
+@pytest.mark.parametrize("status", ["FAILED", "UNKNOWN", "SENDING"])
+def test_failed_notification_does_not_hide_archive_error_or_loop(pipeline, monkeypatch, status):
+    library, worker, _, _, _, organized = pipeline
+    original = worker.bridge
+    sent = []
+    def bridge(method, path, payload=None):
+        if path.endswith("/notify"):
+            sent.append(payload)
+            return {"status": status}
+        return original(method, path, payload)
+    monkeypatch.setattr(worker, "bridge", bridge)
+    organized["notes"] = []
+    for _ in range(5):
+        worker.tick()
+    state = library.list_jobs()[0]
+    assert state["status"] == "FAILED" and state["error"]
+    assert state["failureNotification"]["status"] == status
+    assert len(sent) == 1
+
+
+def test_pending_failure_notification_resumes_after_restart(pipeline, monkeypatch):
+    library, worker, _, job, _, _ = pipeline
+    worker.update(job["id"], status="FAILED", error="整理失败", result={"failureNotification": {
+        "status": "PENDING", "attempt": 0, "stage": "HERMES", "reason": "整理失败"}})
+    restarted = ArchiveWorker(library)
+    calls = []
+    monkeypatch.setattr(restarted, "bridge", lambda method, path, payload: calls.append(payload) or {"status": "SENT"})
+    restarted.tick()
+    restarted.tick()
+    assert len(calls) == 1 and calls[0]["event"] == "failed"
+    assert library.list_jobs()[0]["status"] == "FAILED"
+
+
+def test_failed_then_successful_archive_can_send_both_events(pipeline, monkeypatch):
+    library, worker, _, job, _, organized = pipeline
+    original = worker.bridge
+    notes = organized["notes"]
+    organized["notes"] = []
+    sent = []
+    def bridge(method, path, payload=None):
+        if path.endswith("/notify"):
+            sent.append(payload)
+        return original(method, path, payload)
+    monkeypatch.setattr(worker, "bridge", bridge)
+    worker.tick()
+    worker.tick()
+    library.retry_job(job["id"])
+    organized["notes"] = notes
+    for _ in range(4):
+        worker.tick()
+    assert library.list_jobs()[0]["status"] == "COMPLETED"
+    assert [payload.get("event", "completed") for payload in sent] == ["failed", "completed"]
+
+
+def test_notify_stage_failure_does_not_emit_archive_failed_event(pipeline, monkeypatch):
+    library, worker, _, _, _, _ = pipeline
+    original = worker.bridge
+    sent = []
+    def bridge(method, path, payload=None):
+        if path.endswith("/notify"):
+            sent.append(payload)
+            return {"status": "FAILED"}
+        return original(method, path, payload)
+    monkeypatch.setattr(worker, "bridge", bridge)
+    for _ in range(5):
+        worker.tick()
+    assert len(sent) == 1 and sent[0].get("event", "completed") == "completed"
+    assert library.list_jobs()[0]["failureNotification"] is None
+    assert library.detail("note-a")["archiveStatus"] == "ARCHIVED"
+
+
+def test_failure_bridge_connection_error_keeps_archive_failure(pipeline, monkeypatch):
+    library, worker, _, _, _, organized = pipeline
+    original = worker.bridge
+    calls = []
+    def bridge(method, path, payload=None):
+        if path.endswith("/notify"):
+            calls.append(payload)
+            raise ConnectionError("敏感的第三方响应")
+        return original(method, path, payload)
+    monkeypatch.setattr(worker, "bridge", bridge)
+    organized["notes"] = []
+    for _ in range(4):
+        worker.tick()
+    job = library.list_jobs()[0]
+    assert job["status"] == "FAILED" and job["failureNotification"]["status"] == "UNKNOWN"
+    assert "敏感的第三方响应" not in json.dumps(job, ensure_ascii=False)
+    assert len(calls) == 1
+
+
+def test_archive_retry_failure_uses_new_notification_attempt(pipeline, monkeypatch):
+    library, worker, _, job, _, organized = pipeline
+    original = worker.bridge
+    attempts = []
+    def bridge(method, path, payload=None):
+        if path.endswith("/notify"):
+            attempts.append(payload["attempt"])
+        return original(method, path, payload)
+    monkeypatch.setattr(worker, "bridge", bridge)
+    organized["notes"] = []
+    worker.tick()
+    worker.tick()
+    library.retry_job(job["id"])
+    worker.tick()
+    worker.tick()
+    assert attempts == [0, 1]
+    assert library.list_jobs()[0]["status"] == "FAILED"

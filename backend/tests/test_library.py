@@ -135,3 +135,45 @@ def test_browser_clock_cannot_override_server_current_version(library):
     library.save_result("note-a", {"markdown": "当前正文"}, created_at="2026-09-13")
     library.import_legacy([legacy(content="旧正文", created="2030-01-01")])
     assert library.detail("note-a")["markdown"][0]["content"] == "当前正文"
+
+
+@pytest.mark.parametrize("status,stage", [("QUEUED", "UPLOAD"), ("RUNNING", "HERMES"),
+                                         ("FAILED", "PUBLISH"), ("FAILED", "NOTIFY"), ("COMPLETED", "NOTIFY")])
+def test_history_includes_latest_archive_job(library, status, stage):
+    from app.db.models.library import ArchiveJob
+    library.import_legacy([legacy()])
+    job = library.create_job(note_ids=["note-a"])
+    with library.sessions.begin() as db:
+        row = db.get(ArchiveJob, job["id"])
+        row.status, row.stage = status, stage
+    expected = {"id": job["id"], "status": status, "stage": stage}
+    assert library.list_notes()["items"][0]["archiveJob"] == expected
+    assert library.detail("note-a")["archiveJob"] == expected
+
+
+def test_archive_filter_not_limited_to_recent_100_jobs(library):
+    from app.db.models.library import ArchiveJob
+    library.import_legacy([legacy()])
+    job = library.create_job(note_ids=["note-a"])
+    with library.sessions.begin() as db:
+        db.get(ArchiveJob, job["id"]).status = "FAILED"
+        for index in range(101):
+            db.add(ArchiveJob(id=f"other-{index}", fingerprint=str(index), scope="notes", status="COMPLETED",
+                             snapshot={"notes": [{"id": "other", "audioMeta": {"title": "其他笔记"}}]},
+                             created_at="2099-01-01", updated_at="2099-01-01"))
+    assert len(library.list_jobs()) == 100
+    assert library.list_notes()["items"][0]["archiveJob"]["id"] == job["id"]
+
+
+def test_newer_archive_success_supersedes_old_failure(library):
+    from app.db.models.library import ArchiveJob
+    library.import_legacy([legacy()])
+    first = library.create_job(note_ids=["note-a"])
+    library.save_result("note-a", {"markdown": "新版"})
+    second = library.create_job(note_ids=["note-a"])
+    with library.sessions.begin() as db:
+        old = db.get(ArchiveJob, first["id"])
+        old.status, old.created_at = "FAILED", "2026-01-01"
+        new = db.get(ArchiveJob, second["id"])
+        new.status, new.stage, new.created_at = "COMPLETED", "NOTIFY", "2026-01-02"
+    assert library.list_notes()["items"][0]["archiveJob"]["id"] == second["id"]

@@ -193,9 +193,9 @@ def webhook_result(status, raw, route, delivery_id):
     return unknown
 
 
-def send_webhook(job_id, message, url, secret):
-    delivery_id = f"bilinote-archive-{job_id}"
-    body = json.dumps({"event_type": "bilinote.archive.completed", "job_id": job_id,
+def send_webhook(job_id, message, url, secret, event="completed", attempt=0):
+    delivery_id = f"bilinote-archive-{job_id}" + (f"-failed-{attempt}" if event == "failed" else "")
+    body = json.dumps({"event_type": f"bilinote.archive.{event}", "job_id": job_id,
                        "delivery_id": delivery_id, "message": message},
                       ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     timestamp = str(int(time.time()))
@@ -221,19 +221,24 @@ def send_webhook(job_id, message, url, secret):
         connection.close()
 
 
-def notify(job_id, message):
+def notify(job_id, message, event="completed", attempt=0):
+    if event not in ("completed", "failed") or type(attempt) is not int or not 0 <= attempt <= 1000000:
+        raise ValueError("通知事件或重试次数无效")
     if not isinstance(message, str) or not message.strip() or len(message.encode("utf-8")) > 12000:
         raise ValueError("通知内容无效或过长")
     job_dir = folder(job_id)
-    notification_path = job_dir / "notification.json"
+    # 失败通知按尝试次数独立去重，不能占用原来的完成通知记录和投递 ID。
+    name = f"failure-notification-{attempt}" if event == "failed" else "notification"
+    notification_path = job_dir / f"{name}.json"
     with LOCK:
-        if load(job_dir / "state.json", {}).get("status") != "COMPLETED":
+        if event == "completed" and load(job_dir / "state.json", {}).get("status") != "COMPLETED":
             raise ValueError("整理尚未完成，不能发送完成通知")
         previous = load(notification_path)
         if previous and previous["status"] in ("SENT", "SENDING", "UNKNOWN"):
             return previous
         transport, url, secret = notification_config()
-        message_path = job_dir / "notification.txt"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        message_path = job_dir / f"{name}.txt"
         # 同一任务重试复用原文和 ID，不能偷偷改变已经提交过的通知。
         if message_path.exists():
             message = message_path.read_text(encoding="utf-8")
@@ -242,7 +247,8 @@ def notify(job_id, message):
         save(notification_path, {"status": "SENDING", "transport": transport})
     try:
         if transport == "webhook":
-            notification = send_webhook(job_id, message, url, secret)
+            notification = (send_webhook(job_id, message, url, secret, event, attempt) if event == "failed"
+                            else send_webhook(job_id, message, url, secret))
         else:
             result = subprocess.run([sys.executable, "-m", "hermes_cli.main", "send", "--to", TARGET,
                 "--file", str(message_path), "--json"], cwd=HERMES, capture_output=True, timeout=45)
@@ -362,7 +368,8 @@ class Handler(BaseHTTPRequestHandler):
                     save(job_dir / "state.json", state)
                 return self.reply({"status": state["status"]}, 202)
             if self.path.startswith("/jobs/") and self.path.endswith("/notify"):
-                return self.reply(notify(self.path.split("/")[2], data["message"]))
+                return self.reply(notify(self.path.split("/")[2], data["message"],
+                                         data.get("event", "completed"), data.get("attempt", 0)))
             return self.reply({"error": "接口不存在"}, 404)
         except (ValueError, KeyError, OSError):
             return self.reply({"error": "请求或入库清单无效"}, 400)
@@ -386,7 +393,7 @@ if __name__ == "__main__":
         if state["status"] == "RUNNING":
             state["status"] = "QUEUED"
             save(path, state)
-    for path in STATE.glob("*/notification.json"):
+    for path in STATE.glob("*/*notification*.json"):
         state = load(path)
         if state["status"] == "SENDING":
             save(path, {"status": "UNKNOWN", "error": "通知发送过程中服务重启，请先确认是否已收到"})

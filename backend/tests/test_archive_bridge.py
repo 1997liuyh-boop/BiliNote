@@ -277,8 +277,9 @@ def test_cli_notification_remains_available(webhook, monkeypatch):
     assert bridge.notify(job_id, "已入库") == {"status": "SENT", "transport": "cli"}
 
 
+@pytest.mark.parametrize("event", ["completed", "failed"])
 @pytest.mark.parametrize("status,expected", [(200, "SENT"), (302, "UNKNOWN")])
-def test_webhook_local_http_roundtrip(webhook, monkeypatch, status, expected):
+def test_webhook_local_http_roundtrip(webhook, monkeypatch, status, expected, event):
     import hashlib
     import hmac
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -308,12 +309,68 @@ def test_webhook_local_http_roundtrip(webhook, monkeypatch, status, expected):
     monkeypatch.setenv("ARCHIVE_HERMES_WEBHOOK_URL", f"http://127.0.0.1:{server.server_port}/webhooks/bilinote-archive")
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
     try:
-        assert bridge.notify(job_id, "本机回归：已入库")["status"] == expected
+        assert bridge.notify(job_id, "本机回归：通知", event, 2)["status"] == expected
     finally:
         server.shutdown()
         server.server_close()
         thread.join(5)
     assert len(received) == 1
     assert received[0][0] == "/webhooks/bilinote-archive"
-    assert received[0][1]["message"] == "本机回归：已入库"
+    assert received[0][1]["message"] == "本机回归：通知"
+    assert received[0][1]["event_type"] == f"bilinote.archive.{event}"
+    assert received[0][1]["delivery_id"] == f"bilinote-archive-{job_id}" + ("-failed-2" if event == "failed" else "")
     assert received[0][2] is True
+
+
+@pytest.mark.parametrize("bridge_status", [None, "RUNNING", "FAILED", "COMPLETED"])
+def test_failure_notification_is_allowed_at_any_archive_stage(webhook, monkeypatch, bridge_status):
+    bridge, job_id = webhook
+    state_path = bridge.folder(job_id) / "state.json"
+    if bridge_status is None:
+        state_path.unlink()
+    else:
+        bridge.save(state_path, {"status": bridge_status})
+    sent = []
+    monkeypatch.setattr(bridge, "send_webhook", lambda *args: sent.append(args) or {"status": "SENT"})
+    assert bridge.notify(job_id, "入库失败", "failed", 0)["status"] == "SENT"
+    assert bridge.notify(job_id, "重复失败", "failed", 0)["status"] == "SENT"
+    assert len(sent) == 1 and sent[0][4:] == ("failed", 0)
+    assert not (bridge.folder(job_id) / "notification.json").exists()
+    bridge.save(state_path, {"status": "COMPLETED"})
+    assert bridge.notify(job_id, "入库完成")["status"] == "SENT"
+    assert len(sent) == 2
+
+
+def test_failure_notifications_are_independent_per_attempt(webhook, monkeypatch):
+    bridge, job_id = webhook
+    sent = []
+    monkeypatch.setattr(bridge, "send_webhook", lambda *args: sent.append(args) or {"status": "SENT"})
+    bridge.notify(job_id, "第一次入库失败", "failed", 0)
+    bridge.notify(job_id, "第二次入库失败", "failed", 1)
+    bridge.notify(job_id, "重复调用", "failed", 1)
+    assert len(sent) == 2
+    assert [args[-1] for args in sent] == [0, 1]
+
+
+@pytest.mark.parametrize("status", ["SENT", "UNKNOWN", "SENDING"])
+def test_persisted_failure_notification_prevents_resend(webhook, monkeypatch, status):
+    bridge, job_id = webhook
+    bridge.save(bridge.folder(job_id) / "failure-notification-0.json", {"status": status})
+    monkeypatch.setattr(bridge, "send_webhook", lambda *args: pytest.fail("失败通知不能重复发送"))
+    assert bridge.notify(job_id, "入库失败", "failed", 0)["status"] == status
+
+
+@pytest.mark.parametrize("event,attempt", [("unknown", 0), ("failed", -1), ("failed", "../x"), ("failed", True)])
+def test_notification_rejects_invalid_event_or_attempt(webhook, event, attempt):
+    bridge, job_id = webhook
+    with pytest.raises(ValueError, match="通知事件"):
+        bridge.notify(job_id, "入库失败", event, attempt)
+
+
+def test_failure_notification_before_manifest_exists(webhook, monkeypatch):
+    import uuid
+    bridge, _ = webhook
+    job_id = str(uuid.uuid4())
+    monkeypatch.setattr(bridge, "send_webhook", lambda *args: {"status": "SENT"})
+    assert bridge.notify(job_id, "上传失败", "failed")["status"] == "SENT"
+    assert (bridge.folder(job_id) / "failure-notification-0.json").is_file()
