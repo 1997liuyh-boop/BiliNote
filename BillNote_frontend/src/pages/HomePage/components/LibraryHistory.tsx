@@ -4,7 +4,7 @@ import toast from 'react-hot-toast'
 import VaultExplorer from './VaultExplorer'
 import { getArchiveState, matchesArchiveFilter } from './archiveState'
 import { useTaskStore, type Task } from '@/store/taskStore'
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { assignNotes, createArchiveJob, createCategory, deleteCategory, getArchiveConfig,
   listArchiveJobs, listCategories, renameCategory, retryArchiveJob,
@@ -34,6 +34,8 @@ export default function LibraryHistory({ onSelect, selectedId }: {
   const [busy, setBusy] = useState(false)
   const [dialog, setDialog] = useState<{ id?: string; assign?: boolean } | null>(null)
   const [name, setName] = useState('')
+  const [archiveSelection, setArchiveSelection] = useState<string[] | null>(null)
+  const [autoClassify, setAutoClassify] = useState(false)
 
   const refresh = async () => {
     const [nextCategories, nextJobs, config] = await Promise.all([listCategories(), listArchiveJobs(), getArchiveConfig(), syncHistory()])
@@ -81,10 +83,17 @@ export default function LibraryHistory({ onSelect, selectedId }: {
     catch { /* 请求层统一展示可读错误。 */ }
     finally { setBusy(false) }
   }
-  const archive = (ids: string[], categoryId?: string) => run(async () => {
-    const job = await createArchiveJob(ids, categoryId)
+  const archive = (ids: string[], categoryId?: string, classify = false) => run(async () => {
+    const job = await createArchiveJob(ids, categoryId, classify)
+    if (job.status === 'FAILED') {
+      setArchiveSelection(null)
+      toast.error(`该版本已有失败任务：${job.error || '请查看最近入库任务'}。处理原因后点击任务中的“重试”。`)
+      return
+    }
+    setArchiveSelection(null)
     toast.success(job.status === 'COMPLETED' ? '该版本已经入库，无需重复整理' : '入库任务已提交，可关闭网页等待 QQ 提醒')
   })
+  const openArchive = (ids: string[]) => { setAutoClassify(false); setArchiveSelection(ids) }
   const move = (value: string) => {
     if (!value) return
     if (value === 'new') { setName(''); setDialog({ assign: true }); return }
@@ -126,10 +135,12 @@ export default function LibraryHistory({ onSelect, selectedId }: {
         </span>
         {task.status !== 'SUCCESS' && <span>{task.status === 'FAILED' ? '生成失败' : '生成中'}</span>}
       </div>
+      {task.archiveJob?.published && task.archiveJob.status === 'FAILED' && task.archiveJob.stage !== 'NOTIFY' &&
+        <p className="mt-1 text-[10px] text-amber-700">本篇已入库，所属批次未全部完成；请查看最近入库任务。</p>}
       {task.archivePath && <p className="mt-1.5 truncate text-[10px] text-neutral-400" title={task.archivePath}>Vault：{task.archivePath}</p>}
       <div className="mt-2 flex items-center justify-end gap-2">
         <button className={`${control} flex items-center gap-1`} disabled={!ready || busy || task.status !== 'SUCCESS'}
-          onClick={() => void archive([task.id])}><Archive size={12} />手动入库</button>
+          onClick={() => openArchive([task.id])}><Archive size={12} />手动入库</button>
         <button className="rounded p-1 text-neutral-400 hover:bg-red-50 hover:text-red-600" aria-label={`删除 ${task.audioMeta.title}`}
           disabled={busy} onClick={() => { if (window.confirm('将这条笔记从生成历史移除？已入库的文件会保留。')) void run(() => removeTask(task.id)) }}><Trash size={13} /></button>
       </div>
@@ -171,7 +182,7 @@ export default function LibraryHistory({ onSelect, selectedId }: {
         <option value="">归入分类…</option><option value="new">新建分类并归入</option><option value="none">取消归类</option>
         {categories.map(category => <option key={category.id} value={category.id}>{category.name}</option>)}
       </select>
-      <button className={control} disabled={busy || !ready} onClick={() => void archive(selected)}>手动入库</button>
+      <button className={control} disabled={busy || !ready} onClick={() => openArchive(selected)}>手动入库</button>
       <button className="text-xs text-neutral-500" onClick={() => setSelected([])}>取消选择</button>
     </div>}
     {!ready && <p className="text-[11px] text-neutral-500">入库连接待配置；可以正常归类和查看历史。</p>}
@@ -203,6 +214,8 @@ export default function LibraryHistory({ onSelect, selectedId }: {
       <summary className="cursor-pointer text-xs font-medium">最近入库任务</summary>
       <div className="mt-2 flex flex-col gap-2">{jobs.slice(0, 10).map(job => <div key={job.id} className="rounded bg-neutral-50 p-2 text-xs">
         <p>{job.snapshot.category?.name || `${job.snapshot.notes.length} 条笔记`} · {job.stage === 'NOTIFY' && job.status === 'FAILED' ? '已入库，通知失败' : archiveLabels[job.status] || job.status}</p>
+        {job.status === 'FAILED' && job.stage !== 'NOTIFY' && (job.publishedCount ?? 0) > 0 &&
+          <p className="mt-1 text-amber-700">部分完成：{job.publishedCount} / {job.snapshot.notes.length} 篇正文已入库，批次尚未完成。</p>}
         {job.error && <p className="mt-1 break-words text-red-600">{job.error}</p>}
         {job.stage === 'NOTIFY' && ['FAILED', 'UNKNOWN', 'SENDING'].includes(job.notification) &&
           <p className="text-amber-700">完成通知{job.notification === 'FAILED' ? '发送失败' : '送达状态未确认，请先核对收信'}</p>}
@@ -211,6 +224,19 @@ export default function LibraryHistory({ onSelect, selectedId }: {
         {job.status === 'FAILED' && <button className={`${control} mt-1`} disabled={busy} onClick={() => void run(() => retryArchiveJob(job.id))}>重试</button>}
       </div>)}</div>
     </details>}
+    <Dialog open={archiveSelection !== null} onOpenChange={open => { if (!open && !busy) setArchiveSelection(null) }}>
+      <DialogContent><DialogHeader><DialogTitle>手动入库</DialogTitle></DialogHeader>
+        <DialogDescription>将整理并入库 {archiveSelection?.length || 0} 篇笔记。正文、目录全部更新成功后发送完成通知。</DialogDescription>
+        <label className="flex items-start gap-2 rounded-lg border border-neutral-200 p-3 text-sm">
+          <input type="checkbox" checked={autoClassify} onChange={event => setAutoClassify(event.target.checked)} disabled={busy} className="mt-0.5 h-4 w-4 shrink-0 accent-primary" />
+          <span>自动分类<span className="mt-1 block text-xs text-neutral-500">仅对未归类笔记按内容分类，优先使用已有分类，必要时创建新分类；保留已有分类。</span></span>
+        </label>
+        <div className="flex justify-end gap-2">
+          <button className={control} disabled={busy} onClick={() => setArchiveSelection(null)}>取消</button>
+          <button className={`${control} bg-neutral-900 text-white`} disabled={busy || !archiveSelection?.length} onClick={() => void archive(archiveSelection || [], undefined, autoClassify)}>确认入库</button>
+        </div>
+      </DialogContent>
+    </Dialog>
     <Dialog open={dialog !== null} onOpenChange={open => { if (!open) setDialog(null) }}>
       <DialogContent aria-describedby="library-category-description"><DialogHeader><DialogTitle>{dialog?.id ? '重命名分类' : '创建分类'}</DialogTitle></DialogHeader>
         <form className="flex flex-col gap-3" onSubmit={event => { event.preventDefault(); void saveCategory() }}>

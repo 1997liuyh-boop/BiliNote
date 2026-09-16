@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import logging
@@ -12,7 +13,7 @@ from sqlalchemy import select
 
 from app.db.models.library import ArchiveJob, LibraryCategory, LibraryNote
 from app.services.library import library, now
-from app.services.obsidian import category_path, document, render_archive, wikilink
+from app.services.obsidian import category_path, document, wikilink
 from app.services.webdav_archive import WebDAV
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,7 @@ class ArchiveWorker:
         stage_label = {"UPLOAD": "上传文件", "HERMES": "Hermes 整理", "PUBLISH": "写入 Obsidian"}.get(failure["stage"], failure["stage"])
         message = (f"BiliNote 入库失败：{label}，共 {len(snapshot['notes'])} 条笔记。\n"
                    f"笔记：{titles}\n失败阶段：{stage_label}\n原因：{failure['reason'][:500]}\n"
+                   f"已校验入库：{len(result.get('publishedNoteIds', []))}/{len(snapshot['notes'])} 条。\n"
                    f"任务：{job_id}\n请在生成历史的入库任务中处理原因后重试；本次入库未全部完成。")
         try:
             state = self.bridge("POST", f"/jobs/{job_id}/notify", {
@@ -123,9 +125,7 @@ class ArchiveWorker:
                     raise ValueError(state.get("error") or "Hermes 整理失败")
                 if state["status"] != "COMPLETED":
                     return
-                files, paths = render_archive(snapshot, state["result"])
-                result = {"files": files, "paths": paths, "overview": "BiliNote/总览.md"}
-                self.update(job_id, result=result, stage="PUBLISH")
+                self.library.prepare_archive(job_id, state["result"])
                 return
             if stage == "PUBLISH":
                 self.publish(dav, job_id, snapshot, result)
@@ -178,6 +178,7 @@ class ArchiveWorker:
     def publish(self, dav, job_id, snapshot, result):
         raw, index_etag = dav.get(INDEX_PATH)
         index = json.loads(raw) if raw else {"files": {}, "notes": {}, "categories": {}}
+        committed_index = copy.deepcopy(index)
         files = dict(result["files"])
         for note in snapshot["notes"]:
             category_id = note.get("categoryId")
@@ -212,29 +213,71 @@ class ArchiveWorker:
             for n in sorted(index["notes"].values(), key=lambda n: n["updated"], reverse=True)[:50])
         overview += "\n\n## 未归类\n\n" + "\n".join("- " + wikilink(n["path"], n["title"])
             for n in index["notes"].values() if not n.get("category_id"))
-        files["BiliNote/总览.md"] = document({"tags": ["bilinote", "总览"], "bilinote_managed": True}, overview)
+        overview_path = "BiliNote/总览.md"
+        existing_overview, _ = dav.get(overview_path)
+        section = "<!-- bilinote-overview:start -->\n" + overview + "\n<!-- bilinote-overview:end -->"
+        overview_content = document({"tags": ["bilinote", "总览"], "bilinote_managed": True}, section)
+        if existing_overview is not None:
+            text = existing_overview.decode()
+            pattern = r"<!-- bilinote-overview:start -->.*?<!-- bilinote-overview:end -->"
+            blocks = list(re.finditer(pattern, text, flags=re.DOTALL))
+            if blocks:
+                if (len(blocks) != 1 or text.count("<!-- bilinote-overview:start -->") != 1
+                        or text.count("<!-- bilinote-overview:end -->") != 1
+                        or (sha(blocks[0].group().encode()) != index.get("overviewSectionHash")
+                            and blocks[0].group() != section)):
+                    raise ValueError("总览的自动索引区域已被修改，已保留原文件；请处理该区域冲突后重试")
+                overview_content = text[:blocks[0].start()] + section + text[blocks[0].end():]
+            elif "<!-- bilinote-overview:" in text:
+                raise ValueError("总览的自动索引区域标记不完整，已保留原文件；请处理冲突后重试")
+            elif sha(existing_overview) != index["files"].get(overview_path):
+                # 旧总览已被编辑时只追加自动区域，不覆盖原文或用户维护的目录。
+                overview_content = text + "\n\n" + section + "\n"
+        files[overview_path] = overview_content
+        prepared = {}
+        # 先检查所有文档冲突，避免写完正文后才发现后续文件无法更新。
         for path, content in files.items():
             content = self.attachments(dav, job_id, path, content).encode()
             previous, etag = dav.get(path)
             expected = index["files"].get(path)
-            if previous is not None and previous != content and (not expected or sha(previous) != expected):
+            if path == overview_path and previous != existing_overview:
+                raise ValueError("总览在发布期间发生变化，请重试")
+            if path != overview_path and previous is not None and previous != content and (not expected or sha(previous) != expected):
                 raise ValueError(f"{path} 已被手动修改，已保留原文件；请处理冲突后重试")
+            if previous != content and previous is not None and not etag:
+                raise ValueError("WebDAV 未提供 ETag，无法安全更新已有文件")
+            prepared[path] = (content, previous, etag)
+        for path, (content, previous, etag) in prepared.items():
             if previous != content:
-                if previous is not None and not etag:
-                    raise ValueError("WebDAV 未提供 ETag，无法安全更新已有文件")
                 dav.put(path, content, etag=etag, new=previous is None)
             verification, _ = dav.get(path)
             if verification != content:
                 raise ValueError("WebDAV 文件回读校验失败")
-            index["files"][path] = sha(content)
-            dav.put(INDEX_PATH, json.dumps(index, ensure_ascii=False).encode(), etag=index_etag, new=raw is None)
+            sources = [n for n in snapshot["notes"] if result["paths"][n["id"]] == path]
+            # 持久化索引只登记已回读成功的正文，避免部分失败时列出尚未写入的笔记。
+            committed_index["files"][path] = sha(content)
+            for source in sources:
+                committed_index["notes"][source["id"]] = index["notes"][source["id"]]
+            for category_id, category in index["categories"].items():
+                if category["path"] == path:
+                    committed_index["categories"][category_id] = category
+            if path == overview_path:
+                committed_index["overviewSectionHash"] = sha(section.encode())
+            dav.put(INDEX_PATH, json.dumps(committed_index, ensure_ascii=False).encode(), etag=index_etag, new=raw is None)
             raw, index_etag = dav.get(INDEX_PATH)
+            # 每篇正文回读及索引提交成功后立即记录，后续失败不抹掉已经入库的事实。
+            if sources:
+                published = set(result.get("publishedNoteIds", []))
+                with self.library.sessions.begin() as db:
+                    for source in sources:
+                        note = db.get(LibraryNote, source["id"])
+                        if note and not note.deleted:
+                            note.archived_hash = source["fingerprint"]
+                            note.archived_path = path
+                            published.add(note.id)
+                    result["publishedNoteIds"] = sorted(published)
+                    db.get(ArchiveJob, job_id).result = dict(result)
         with self.library.sessions.begin() as db:
-            for source in snapshot["notes"]:
-                note = db.get(LibraryNote, source["id"])
-                if note and not note.deleted:
-                    note.archived_hash = source["fingerprint"]
-                    note.archived_path = result["paths"][note.id]
             category = snapshot.get("category")
             if category:
                 row = db.get(LibraryCategory, category["id"])

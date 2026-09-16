@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import logging
@@ -49,6 +50,7 @@ def job_dict(job):
     return {"id": job.id, "scope": job.scope, "category_id": job.category_id,
             "status": job.status, "stage": job.stage, "error": job.error,
             "notification": job.notification, "failureNotification": job.result.get("failureNotification"),
+            "publishedCount": len(job.result.get("publishedNoteIds", [])),
             "createdAt": job.created_at,
             "updatedAt": job.updated_at, "snapshot": job.snapshot, "result": job.result}
 
@@ -255,7 +257,7 @@ class LibraryService:
         remaining, latest = set(note_ids), {}
         if not remaining:
             return latest
-        rows = db.execute(select(ArchiveJob.id, ArchiveJob.status, ArchiveJob.stage, ArchiveJob.snapshot)
+        rows = db.execute(select(ArchiveJob.id, ArchiveJob.status, ArchiveJob.stage, ArchiveJob.snapshot, ArchiveJob.result)
                           .order_by(ArchiveJob.created_at.desc(), ArchiveJob.id.desc())
                           .execution_options(yield_per=100))
         try:
@@ -263,6 +265,8 @@ class LibraryService:
                 for note in row.snapshot.get("notes", []):
                     if note["id"] in remaining:
                         latest[note["id"]] = {"id": row.id, "status": row.status, "stage": row.stage}
+                        if note["id"] in row.result.get("publishedNoteIds", []):
+                            latest[note["id"]]["published"] = True
                         remaining.remove(note["id"])
                 if not remaining:
                     break
@@ -389,7 +393,9 @@ class LibraryService:
                                "archivePath": category.archived_path})
             return result
 
-    def create_job(self, note_ids=None, category_id=None):
+    def create_job(self, note_ids=None, category_id=None, auto_classify=False):
+        if auto_classify and category_id:
+            raise ValueError("整类入库保留现有分类，不支持自动分类")
         self.refresh_files(force=True)
         with self.sessions.begin() as db:
             category = db.get(LibraryCategory, category_id) if category_id else None
@@ -413,12 +419,18 @@ class LibraryService:
                 value["categoryPath"] = assigned.archived_path if assigned else ""
                 snapshot_notes.append(value)
             snapshot = {"notes": snapshot_notes, "category": None}
+            if auto_classify:
+                snapshot["autoClassify"] = True
+                snapshot["categories"] = [{"id": c.id, "name": c.name} for c in
+                                          db.scalars(select(LibraryCategory).order_by(LibraryCategory.name))]
             if category:
                 snapshot["category"] = {"id": category.id, "name": category.name,
                                         "archivePath": category.archived_path,
                                         "fingerprint": self.category_fingerprint(category, notes)}
             fingerprint = digest([category_id, snapshot["category"]["fingerprint"] if category else None,
                                   sorted(n["fingerprint"] for n in snapshot_notes)])
+            if auto_classify:
+                fingerprint = digest([fingerprint, "auto-classify"])
             existing = db.scalar(select(ArchiveJob).where(ArchiveJob.fingerprint == fingerprint))
             if existing:
                 return job_dict(existing)
@@ -435,6 +447,45 @@ class LibraryService:
                     raise
                 return job_dict(existing)
             return job_dict(job)
+
+    def prepare_archive(self, job_id, organized):
+        from app.services.obsidian import render_archive
+        # 分类、快照和渲染结果一起提交，校验失败时不留下半完成的归类。
+        with self.sessions.begin() as db:
+            job = db.get(ArchiveJob, job_id)
+            snapshot = copy.deepcopy(job.snapshot)
+            values = organized.get("notes", [])
+            if not isinstance(values, list) or any(not isinstance(v, dict) for v in values):
+                raise ValueError("整理结果格式错误")
+            if len(values) != len(snapshot["notes"]) or {v.get("id") for v in values} != {n["id"] for n in snapshot["notes"]}:
+                raise ValueError("整理结果没有完整覆盖本次入库范围")
+            organized_notes = {v["id"]: v for v in values}
+            if snapshot.get("autoClassify"):
+                for source in snapshot["notes"]:
+                    if source.get("categoryId"):
+                        continue
+                    note = self.require_note(db, source["id"])
+                    if note_fingerprint(note) != source["fingerprint"]:
+                        raise ValueError("笔记或分类在整理期间发生变化，请按当前版本重新入库")
+                    name = organized_notes[source["id"]].get("category_name")
+                    if not isinstance(name, str) or not name.strip() or len(name.strip()) > 100 or any(ord(c) < 32 for c in name):
+                        raise ValueError("自动分类名称无效，请重试整理")
+                    name = name.strip()
+                    category = db.scalar(select(LibraryCategory).where(LibraryCategory.name == name))
+                    if category is None:
+                        category = LibraryCategory(id=str(uuid.uuid4()), name=name, created_at=now(), updated_at=now())
+                        db.add(category)
+                        db.flush()
+                    note.category_id = category.id
+                    note.payload = {**note.payload, "categoryName": name}
+                    note.updated_at = now()
+                    source.update(categoryId=category.id, categoryName=name, categoryPath=category.archived_path,
+                                  fingerprint=note_fingerprint(note))
+            files, paths = render_archive(snapshot, organized)
+            job.snapshot = snapshot
+            job.result = {"files": files, "paths": paths, "overview": "BiliNote/总览.md"}
+            job.stage = "PUBLISH"
+            job.updated_at = now()
 
     def list_jobs(self):
         with self.sessions() as db:

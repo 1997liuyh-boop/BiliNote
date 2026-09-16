@@ -330,3 +330,224 @@ def test_archive_retry_failure_uses_new_notification_attempt(pipeline, monkeypat
     worker.tick()
     assert attempts == [0, 1]
     assert library.list_jobs()[0]["status"] == "FAILED"
+
+
+def test_modified_legacy_overview_preserves_user_text_across_updates(pipeline):
+    library, worker, dav, _, calls, organized = pipeline
+    original = "---\ntags: [私人目录]\n---\n\n# 手工总览\n\n保留这一段。\n".encode()
+    dav.files["BiliNote/总览.md"] = original
+    for _ in range(4):
+        worker.tick()
+    assert library.list_jobs()[0]["status"] == "COMPLETED"
+    assert dav.files["BiliNote/总览.md"].startswith(original)
+    dav.files["BiliNote/总览.md"] += "\n末尾手工备注\n".encode()
+    library.import_legacy([{"id": "note-b", "status": "SUCCESS", "markdown": "B正文", "audioMeta": {"title": "B"}}])
+    library.create_job(note_ids=["note-b"])
+    organized["notes"] = [{"id": "note-b", "body": "B整理", "tags": [], "related_ids": []}]
+    for _ in range(4):
+        worker.tick()
+    text = dav.files["BiliNote/总览.md"].decode()
+    assert text.startswith(original.decode()) and text.endswith("末尾手工备注\n")
+    assert text.count("<!-- bilinote-overview:start -->") == 1 and "note-b" in text
+    assert library.list_jobs()[0]["status"] == "COMPLETED"
+    assert sum(path.endswith("/notify") for _, path in calls) == 2
+
+
+@pytest.mark.parametrize("change", ["body", "marker"])
+def test_edited_managed_overview_blocks_all_new_documents(pipeline, change):
+    library, worker, dav, _, _, organized = pipeline
+    for _ in range(4):
+        worker.tick()
+    path = "BiliNote/总览.md"
+    dav.files[path] = dav.files[path].replace(
+        "## 最近入库".encode() if change == "body" else b"<!-- bilinote-overview:end -->", "用户修改".encode())
+    library.import_legacy([{"id": "note-b", "status": "SUCCESS", "markdown": "B正文", "audioMeta": {"title": "B"}}])
+    library.create_job(note_ids=["note-b"])
+    organized["notes"] = [{"id": "note-b", "body": "B整理", "tags": [], "related_ids": []}]
+    before = {key: value for key, value in dav.files.items() if key.endswith(".md")}
+    for _ in range(3):
+        worker.tick()
+    assert library.list_jobs()[0]["status"] == "FAILED"
+    assert {key: value for key, value in dav.files.items() if key.endswith(".md")} == before
+    assert library.detail("note-b")["archiveStatus"] == "UNARCHIVED"
+
+
+def test_partial_publish_keeps_receipt_and_retry_notifies_once(pipeline, monkeypatch):
+    library, worker, dav, job, calls, _ = pipeline
+    original_put, original_bridge = dav.put, worker.bridge
+    notifications = []
+    def put(path, *args, **kwargs):
+        if path == "BiliNote/总览.md":
+            raise ConnectionError("模拟总览写入中断")
+        return original_put(path, *args, **kwargs)
+    def bridge(method, path, payload=None):
+        if path.endswith("/notify"):
+            notifications.append(payload)
+        return original_bridge(method, path, payload)
+    monkeypatch.setattr(dav, "put", put)
+    monkeypatch.setattr(worker, "bridge", bridge)
+    for _ in range(3):
+        worker.tick()
+    state = library.list_jobs()[0]
+    assert state["status"] == "FAILED" and state["publishedCount"] == 1
+    assert library.detail("note-a")["archiveStatus"] == "ARCHIVED"
+    assert library.detail("note-a")["archiveJob"]["published"] is True
+    assert "已校验入库：1/1" in notifications[0]["message"]
+    path = library.detail("note-a")["archivePath"]
+    content = dav.files[path]
+    monkeypatch.setattr(dav, "put", original_put)
+    library.retry_job(job["id"])
+    worker.tick()
+    worker.tick()
+    assert library.list_jobs()[0]["status"] == "COMPLETED" and dav.files[path] == content
+    assert len(notifications) == 2 and notifications[1].get("event") != "failed"
+    assert sum(path == "/jobs" for _, path in calls) == 1
+
+
+def test_legacy_written_note_without_database_receipt_recovers(pipeline):
+    from app.services.archive_worker import INDEX_PATH
+    library, worker, dav, job, calls, _ = pipeline
+    worker.tick()
+    worker.tick()
+    with library.sessions.begin() as db:
+        row = db.get(ArchiveJob, job["id"])
+        path = row.result["paths"]["note-a"]
+        content = row.result["files"][path].encode()
+        row.status = "FAILED"
+        row.error = "总览已被手动修改"
+    dav.files[path] = content
+    dav.files[INDEX_PATH] = json.dumps({"files": {path: sha(content), "BiliNote/总览.md": "old"}, "notes": {}, "categories": {}}).encode()
+    original = "# 用户整理过的总览\n\n不能覆盖。\n".encode()
+    dav.files["BiliNote/总览.md"] = original
+    assert library.detail("note-a")["archiveStatus"] == "UNARCHIVED"
+    library.retry_job(job["id"])
+    worker.tick()
+    worker.tick()
+    assert library.detail("note-a")["archiveStatus"] == "ARCHIVED"
+    assert library.list_jobs()[0]["status"] == "COMPLETED" and dav.files[path] == content
+    assert dav.files["BiliNote/总览.md"].startswith(original)
+    assert sum(path.endswith("/notify") for _, path in calls) == 1
+
+
+def test_later_document_conflict_is_found_before_first_write(pipeline):
+    library, worker, dav, job, _, _ = pipeline
+    worker.tick()
+    worker.tick()
+    with library.sessions() as db:
+        result = db.get(ArchiveJob, job["id"]).result
+    paths = list(result["files"])
+    dav.files[paths[-1]] = "用户自建同名分类文件".encode()
+    worker.tick()
+    assert library.list_jobs()[0]["status"] == "FAILED" and paths[0] not in dav.files
+
+
+def test_auto_classification_reuses_category_and_preserves_assigned(pipeline):
+    library, _, _, job, _, _ = pipeline
+    for key in ["note-b", "note-c"]:
+        library.import_legacy([{"id": key, "status": "SUCCESS", "markdown": "电商正文", "audioMeta": {"title": key}}])
+    auto_job = library.create_job(note_ids=["note-a", "note-b", "note-c"], auto_classify=True)
+    values = [{"id": key, "body": "整理正文", "tags": [], "related_ids": [], "category_name": "电商运营"}
+              for key in ["note-a", "note-b", "note-c"]]
+    library.prepare_archive(auto_job["id"], {"notes": values})
+    assert library.detail("note-a")["categoryId"] == job["category_id"]
+    assert library.detail("note-b")["categoryId"] == library.detail("note-c")["categoryId"]
+    assert len([c for c in library.list_categories() if c["name"] == "电商运营"]) == 1
+    library.import_legacy([{"id": "note-d", "status": "SUCCESS", "markdown": "电商正文", "audioMeta": {"title": "D"}}])
+    next_job = library.create_job(note_ids=["note-d"], auto_classify=True)
+    library.prepare_archive(next_job["id"], {"notes": [{**values[0], "id": "note-d"}]})
+    assert library.detail("note-d")["categoryId"] == library.detail("note-b")["categoryId"]
+
+
+def test_auto_classification_has_separate_fingerprint(pipeline):
+    library, _, _, job, _, _ = pipeline
+    ordinary = library.create_job(note_ids=["note-a"])
+    auto = library.create_job(note_ids=["note-a"], auto_classify=True)
+    assert ordinary["id"] != auto["id"]
+    assert library.create_job(note_ids=["note-a"], auto_classify=True)["id"] == auto["id"]
+    with pytest.raises(ValueError, match="整类入库"):
+        library.create_job(category_id=job["category_id"], auto_classify=True)
+
+
+@pytest.mark.parametrize("failure", ["missing", "invalid", "render", "concurrent"])
+def test_auto_classification_rolls_back_and_never_overwrites_user_change(pipeline, failure):
+    library, _, _, existing, _, _ = pipeline
+    library.import_legacy([{"id": "note-b", "status": "SUCCESS", "markdown": "电商正文", "audioMeta": {"title": "B"}}])
+    job = library.create_job(note_ids=["note-b"], auto_classify=True)
+    note = {"id": "note-b", "body": "正文", "tags": [], "related_ids": [], "category_name": "新主题"}
+    if failure == "missing":
+        del note["category_name"]
+    elif failure == "invalid":
+        note["category_name"] = "分类\n换行"
+    elif failure == "render":
+        note["body"] = "[[不存在的链接]]"
+    else:
+        library.assign(["note-b"], existing["category_id"])
+    with pytest.raises(ValueError):
+        library.prepare_archive(job["id"], {"notes": [note]})
+    expected = existing["category_id"] if failure == "concurrent" else None
+    assert library.detail("note-b")["categoryId"] == expected
+    assert not any(c["name"] == "新主题" for c in library.list_categories())
+    with library.sessions() as db:
+        assert db.get(ArchiveJob, job["id"]).stage == "UPLOAD"
+
+
+def test_partial_index_excludes_unwritten_notes(pipeline, monkeypatch):
+    from app.services.archive_worker import INDEX_PATH
+    library, worker, dav, first, _, _ = pipeline
+    with library.sessions.begin() as db:
+        db.get(ArchiveJob, first["id"]).status = "COMPLETED"
+    library.import_legacy([{"id": "note-b", "status": "SUCCESS", "markdown": "B正文", "audioMeta": {"title": "B"}}])
+    job = library.create_job(note_ids=["note-a", "note-b"])
+    library.prepare_archive(job["id"], {"notes": [{"id": key, "body": "正文", "tags": [], "related_ids": []}
+                                                   for key in ["note-a", "note-b"]]})
+    with library.sessions() as db:
+        failed_path = db.get(ArchiveJob, job["id"]).result["paths"]["note-b"]
+    original = dav.put
+    def put(path, *args, **kwargs):
+        if path == failed_path:
+            raise ConnectionError("模拟第二篇写入失败")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(dav, "put", put)
+    worker.tick()
+    index = json.loads(dav.files[INDEX_PATH])
+    assert "note-a" in index["notes"] and "note-b" not in index["notes"]
+    assert library.detail("note-a")["archiveStatus"] == "ARCHIVED"
+    assert library.detail("note-b")["archiveStatus"] == "UNARCHIVED"
+    assert library.list_jobs()[0]["publishedCount"] == 1
+
+
+def test_archive_route_passes_auto_classification_option(pipeline, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from app.routers import library as routes
+    library, _, _, _, _, _ = pipeline
+    monkeypatch.setattr(routes, "library", library)
+    app = FastAPI()
+    app.include_router(routes.router)
+    with TestClient(app) as client:
+        response = client.post("/library/archive/jobs", json={"note_ids": ["note-a"], "auto_classify": True})
+    assert response.status_code == 200
+    snapshot = response.json()["data"]["snapshot"]
+    assert snapshot["autoClassify"] is True
+    assert snapshot["categories"][0]["name"] == "人工智能"
+
+
+def test_overview_written_before_index_failure_can_be_retried_safely(pipeline, monkeypatch):
+    from app.services.archive_worker import INDEX_PATH
+    library, worker, dav, job, _, _ = pipeline
+    original_put = dav.put
+    def put(path, *args, **kwargs):
+        if path == INDEX_PATH and "BiliNote/总览.md" in dav.files:
+            raise ConnectionError("模拟总览成功后索引提交中断")
+        return original_put(path, *args, **kwargs)
+    monkeypatch.setattr(dav, "put", put)
+    for _ in range(3):
+        worker.tick()
+    assert library.list_jobs()[0]["status"] == "FAILED"
+    overview = dav.files["BiliNote/总览.md"]
+    monkeypatch.setattr(dav, "put", original_put)
+    library.retry_job(job["id"])
+    worker.tick()
+    worker.tick()
+    assert library.list_jobs()[0]["status"] == "COMPLETED"
+    assert dav.files["BiliNote/总览.md"] == overview

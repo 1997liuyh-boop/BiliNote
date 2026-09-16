@@ -374,3 +374,51 @@ def test_failure_notification_before_manifest_exists(webhook, monkeypatch):
     monkeypatch.setattr(bridge, "send_webhook", lambda *args: {"status": "SENT"})
     assert bridge.notify(job_id, "上传失败", "failed")["status"] == "SENT"
     assert (bridge.folder(job_id) / "failure-notification-0.json").is_file()
+
+
+def test_unknown_optional_links_are_discarded_without_losing_valid_links(bridge):
+    value = {"body": "完整正文", "tags": [], "related_ids": ["a", "unknown", "a", "b"]}
+    bridge.validate_note(value, {"a", "b"})
+    assert value["related_ids"] == ["a", "b"]
+
+
+@pytest.mark.parametrize("related", ["a", [1], [None]])
+def test_malformed_related_links_still_fail(bridge, related):
+    with pytest.raises(ValueError, match="关联笔记格式"):
+        bridge.validate_note({"body": "正文", "related_ids": related}, {"a"})
+
+
+@pytest.mark.parametrize("name", [None, "", "   ", "x" * 101, "分类\n名称"])
+def test_auto_category_requires_valid_name(bridge, name):
+    with pytest.raises(ValueError, match="自动分类名称"):
+        bridge.validate_note({"body": "正文", "category_name": name}, set(), True)
+
+
+def test_auto_category_is_trimmed_and_optional_for_normal_archive(bridge):
+    value = {"body": "正文", "category_name": "  电商运营  "}
+    bridge.validate_note(value, set(), True)
+    assert value["category_name"] == "电商运营"
+    bridge.validate_note({"body": "正文"}, set())
+
+
+def test_organize_requests_category_only_for_unassigned_notes(bridge, tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "VAULT", tmp_path)
+    monkeypatch.setattr(bridge, "folder", lambda _: tmp_path / "job")
+    note = {"id": "a", "audioMeta": {"title": "测试"}, "formData": {}, "markdown": [{"content": "正文"}]}
+    monkeypatch.setattr(bridge, "load", lambda _: {
+        "autoClassify": True, "categories": [{"id": "commerce", "name": "电商运营"}],
+        "notes": [note, {**note, "id": "b", "categoryId": "existing"}]})
+    prompts = []
+    def ask(folder, name, prompt, validate):
+        prompts.append(prompt)
+        value = {"body": "整理正文", "tags": [], "related_ids": ["a", "invented"]}
+        if name == "note-0":
+            value["category_name"] = "电商运营"
+        validate(value)
+        return value
+    monkeypatch.setattr(bridge, "ask", ask)
+    result = bridge.organize("job")
+    assert "category_name" in prompts[0] and "电商运营" in prompts[0]
+    assert "category_name" not in prompts[1]
+    assert result["notes"][0]["category_name"] == "电商运营"
+    assert all(note["related_ids"] == ["a"] for note in result["notes"])

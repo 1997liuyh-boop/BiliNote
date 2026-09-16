@@ -47,3 +47,12 @@ test('无任务和已完成任务保持已入库、未入库语义', () => {
   assert.equal(matchesArchiveFilter({}, 'all'), true)
   assert.equal(matchesArchiveFilter({}, 'unarchived'), true)
 })
+
+test('已校验正文不因批次其他文件失败显示入库失败', () => {
+  const task = { archiveStatus: 'ARCHIVED', archiveJob: { status: 'FAILED', stage: 'PUBLISH', published: true } }
+  assert.equal(getArchiveState(task), 'ARCHIVED')
+  assert.equal(matchesArchiveFilter(task, 'failed'), false)
+  assert.equal(matchesArchiveFilter(task, 'archived'), true)
+  assert.equal(getArchiveState({ ...task, archiveStatus: 'OUTDATED' }), 'FAILED')
+  assert.equal(getArchiveState({ ...task, archiveJob: { ...task.archiveJob, published: false } }), 'FAILED')
+})

@@ -17,6 +17,7 @@ export interface ArchiveJob {
   status: string
   stage: string
   error: string
+  publishedCount?: number
   failureNotification?: { status: string; stage: string; reason: string; attempt: number } | null
   notification: string
   createdAt: string
@@ -37,8 +38,8 @@ export const deleteCategory = (id: string) => request.delete(`/library/categorie
 export const assignNotes = (noteIds: string[], categoryId: string | null) =>
   request.post('/library/membership', { note_ids: noteIds, category_id: categoryId })
 export const listArchiveJobs = () => request.get<never, ArchiveJob[]>('/library/archive/jobs', { suppressToast: true })
-export const createArchiveJob = (noteIds: string[], categoryId?: string) =>
-  request.post<never, ArchiveJob>('/library/archive/jobs', { note_ids: noteIds, category_id: categoryId })
+export const createArchiveJob = (noteIds: string[], categoryId?: string, autoClassify = false) =>
+  request.post<never, ArchiveJob>('/library/archive/jobs', { note_ids: noteIds, category_id: categoryId, auto_classify: autoClassify })
 export const retryArchiveJob = (id: string) => request.post(`/library/archive/jobs/${id}/retry`)
 export const getArchiveConfig = () =>
   request.get<never, { ready: boolean; message: string }>('/library/archive/config', { suppressToast: true })

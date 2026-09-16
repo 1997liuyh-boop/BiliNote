@@ -30,7 +30,7 @@ export interface Task {
   platform: string
   formData: Record<string, any>
   categoryId?: string | null
-  archiveJob?: { id: string; status: string; stage: string } | null
+  archiveJob?: { id: string; status: string; stage: string; published?: boolean } | null
   archiveStatus?: string
   archivePath?: string
   revision?: string

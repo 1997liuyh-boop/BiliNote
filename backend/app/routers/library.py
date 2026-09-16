@@ -29,6 +29,7 @@ class ImportRequest(BaseModel):
 class ArchiveRequest(BaseModel):
     note_ids: list[str] = Field(default_factory=list, max_length=500)
     category_id: str | None = None
+    auto_classify: bool = False
 
 
 def perform(action, *args, **kwargs):
@@ -103,7 +104,7 @@ def create_archive_job(data: ArchiveRequest):
         raise HTTPException(status_code=503, detail="请先配置 WebDAV 与 Hermes 入库连接")
     if data.category_id and data.note_ids:
         raise HTTPException(status_code=400, detail="整类入库与多选入库不能同时指定")
-    return perform(library.create_job, data.note_ids, data.category_id)
+    return perform(library.create_job, data.note_ids, data.category_id, data.auto_classify)
 
 
 @router.post("/archive/jobs/{job_id}/retry")
