@@ -7,7 +7,7 @@ import {
   FormLabel,
   FormMessage,
 } from '@/components/ui/form.tsx'
-import { useEffect,useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useForm, useWatch, type FieldErrors } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
@@ -136,6 +136,9 @@ const NoteForm = () => {
   const [collectionBusy, setCollectionBusy] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
   const [uploadSuccess, setUploadSuccess] = useState(false)
+  const uploadPending = useRef(false)
+  const submitPending = useRef(false)
+  const uploadInput = useRef<HTMLInputElement>(null)
   /* ---- 全局状态 ---- */
   const { addPendingTask, currentTaskId, setCurrentTask, getCurrentTask, retryTask } =
     useTaskStore()
@@ -161,6 +164,14 @@ const NoteForm = () => {
   const videoUrl = useWatch({ control: form.control, name: 'video_url' }) || ''
   const videoUnderstandingEnabled = useWatch({ control: form.control, name: 'video_understanding' })
   const editing = currentTask && currentTask.id
+  const uploadContext = useRef({ taskId: currentTaskId, platform })
+  if (uploadContext.current.taskId !== currentTaskId || uploadContext.current.platform !== platform) {
+    uploadContext.current = { taskId: currentTaskId, platform }
+  }
+
+  useEffect(() => {
+    setUploadSuccess(false)
+  }, [currentTaskId, platform])
 
   useEffect(() => {
     setCollectionBusy(false)
@@ -207,7 +218,11 @@ const NoteForm = () => {
   /* ---- 帮助函数 ---- */
   const isGenerating = () => !['SUCCESS', 'FAILED', undefined].includes(getCurrentTask()?.status)
   const generating = isGenerating()
+  const sourceDisabled = generating || collectionBusy || isUploading || form.formState.isSubmitting
   const handleFileUpload = async (file: File, cb: (url: string) => void) => {
+    if (sourceDisabled || uploadPending.current) return
+    uploadPending.current = true
+    const context = uploadContext.current
     const formData = new FormData()
     formData.append('file', file)
     setIsUploading(true)
@@ -215,13 +230,17 @@ const NoteForm = () => {
 
     try {
   
-      const  data  = await uploadFile(formData)
+      const data = await uploadFile(formData)
+      // 上传期间切换了任务或平台时，不把结果写入另一个表单。
+      if (context === uploadContext.current) {
         cb(data.url)
         setUploadSuccess(true)
+      }
     } catch (err) {
       console.error('上传失败:', err)
       // message.error('上传失败，请重试')
     } finally {
+      uploadPending.current = false
       setIsUploading(false)
     }
   }
@@ -241,22 +260,25 @@ const NoteForm = () => {
   }
 
   const onSubmit = async (values: NoteFormValues) => {
-    if (collectionBusy) return
-    console.log('Not even go here')
+    if (generating || collectionBusy || uploadPending.current || submitPending.current) return
+    const model = modelList.find(item => item.model_name === values.model_name)
+    if (!model) {
+      toast.error('请选择可用模型')
+      return
+    }
+    submitPending.current = true
     const payload = {
       ...values,
       video_url:
         values.platform === 'local' ? values.video_url : withScheme(values.video_url || ''),
-      provider_id: modelList.find(m => m.model_name === values.model_name)!.provider_id,
+      provider_id: model.provider_id,
       task_id: currentTaskId || '',
     }
-    if (currentTaskId) {
-      retryTask(currentTaskId, payload)
-      return
-    }
-
-    // message.success('已提交任务')
     try {
+      if (currentTaskId) {
+        await retryTask(currentTaskId, payload)
+        return
+      }
       const data = await generateNote(payload)
       addPendingTask(data.task_id, values.platform, payload)
     } catch (e: unknown) {
@@ -275,6 +297,8 @@ const NoteForm = () => {
       }
       // 其余错误：axios 拦截器已经弹过 toast，这里只兜底不让 promise 变成未处理 rejection
       console.error('提交任务失败：', e)
+    } finally {
+      submitPending.current = false
     }
   }
   const onInvalid = (errors: FieldErrors<NoteFormValues>) => {
@@ -294,14 +318,14 @@ const NoteForm = () => {
         <Button
           type="submit"
           className={!editing ? 'w-full' : 'w-2/3' + ' bg-primary'}
-          disabled={generating || collectionBusy}
+          disabled={sourceDisabled}
         >
           {generating && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
           {label}
         </Button>
 
         {editing && (
-          <Button type="button" variant="outline" className="w-1/3" onClick={handleCreateNew}>
+          <Button type="button" variant="outline" className="w-1/3" disabled={isUploading || form.formState.isSubmitting} onClick={handleCreateNew}>
             <Plus className="mr-2 h-4 w-4" />
             新建笔记
           </Button>
@@ -329,9 +353,15 @@ const NoteForm = () => {
               render={({ field }) => (
                 <FormItem>
                   <Select
-                    disabled={!!editing || collectionBusy}
+                    disabled={sourceDisabled}
                     value={field.value}
-                    onValueChange={field.onChange}
+                    onValueChange={value => {
+                      field.onChange(value)
+                      // 本地路径与网站链接不能跨类型沿用。
+                      if ((value === 'local') !== (field.value === 'local')) {
+                        form.setValue('video_url', '', { shouldDirty: true })
+                      }
+                    }}
                     defaultValue={field.value}
                   >
                     <FormControl>
@@ -362,16 +392,22 @@ const NoteForm = () => {
                 <FormItem className="flex-1">
                   {platform === 'local' ? (
                     <>
-                      <Input disabled={!!editing || collectionBusy} placeholder="请输入本地视频路径" {...field} />
+                      <Input disabled={sourceDisabled} placeholder="请输入本地视频路径" {...field} />
                     </>
                   ) : (
-                    <Input disabled={!!editing || collectionBusy} placeholder="请输入视频网站链接" {...field} />
+                    <Input disabled={sourceDisabled} placeholder="请输入视频网站链接" {...field} />
                   )}
                   <FormMessage style={{ display: 'none' }} />
                 </FormItem>
               )}
             />
           </div>
+
+          {editing && (
+            <p className="text-xs text-muted-foreground">
+              修改视频类型或链接后将创建新任务，保留原笔记；来源不变时重试原任务。
+            </p>
+          )}
 
           {platform === 'bilibili' && !editing && (
             <BilibiliCollection key={videoUrl} videoUrl={videoUrl} getOptions={getCollectionOptions} onBusyChange={setCollectionBusy} />
@@ -384,27 +420,33 @@ const NoteForm = () => {
               <FormItem className="flex-1">
                 {platform === 'local' && (
                   <>
-                    <div
-                      className="hover:border-primary mt-2 flex h-40 cursor-pointer items-center justify-center rounded-md border-2 border-dashed border-gray-300 transition-colors"
+                    <input
+                      ref={uploadInput}
+                      type="file"
+                      accept="video/*"
+                      className="hidden"
+                      disabled={sourceDisabled}
+                      onChange={e => {
+                        const file = e.target.files?.[0]
+                        if (file) void handleFileUpload(file, field.onChange)
+                        e.target.value = ''
+                      }}
+                    />
+                    <button
+                      type="button"
+                      disabled={sourceDisabled}
+                      className="hover:border-primary mt-2 flex h-40 w-full cursor-pointer items-center justify-center rounded-md border-2 border-dashed border-gray-300 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
                       onDragOver={e => {
                         e.preventDefault()
                         e.stopPropagation()
                       }}
                       onDrop={e => {
                         e.preventDefault()
+                        if (sourceDisabled) return
                         const file = e.dataTransfer.files?.[0]
-                        if (file) handleFileUpload(file, field.onChange)
+                        if (file) void handleFileUpload(file, field.onChange)
                       }}
-                      onClick={() => {
-                        const input = document.createElement('input')
-                        input.type = 'file'
-                        input.accept = 'video/*'
-                        input.onchange = e => {
-                          const file = (e.target as HTMLInputElement).files?.[0]
-                          if (file) handleFileUpload(file, field.onChange)
-                        }
-                        input.click()
-                      }}
+                      onClick={() => uploadInput.current?.click()}
                     >
                       {isUploading ? (
                         <p className="text-center text-sm text-blue-500">上传中，请稍候…</p>
@@ -416,7 +458,7 @@ const NoteForm = () => {
                           <span className="text-xs text-gray-400">或点击选择文件</span>
                         </p>
                       )}
-                    </div>
+                    </button>
                   </>
                 )}
                 <FormMessage />

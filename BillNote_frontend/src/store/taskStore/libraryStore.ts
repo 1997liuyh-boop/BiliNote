@@ -95,8 +95,16 @@ export const useTaskStore = create<TaskStore>()(persist((set, get) => ({
     const task = get().tasks.find(item => item.id === id)
     if (!task) return
     const formData = payload || task.formData
-    await generateNote({ ...formData, task_id: id })
-    get().updateTaskContent(id, { status: 'PENDING', errorMessage: '', formData })
+    // 换来源必须换任务 ID，避免命中旧视频的音频、字幕和总结缓存。
+    const sourceChanged = formData.platform !== task.formData.platform ||
+      formData.video_url !== task.formData.video_url
+    const request = { ...formData, task_id: sourceChanged ? '' : id }
+    const result = await generateNote(request)
+    if (sourceChanged) {
+      get().addPendingTask(result.task_id, formData.platform, { ...formData, task_id: result.task_id })
+      return
+    }
+    get().updateTaskContent(id, { status: 'PENDING', errorMessage: '', platform: formData.platform, formData })
   },
   syncHistory: async () => {
     if (get().syncing) return
