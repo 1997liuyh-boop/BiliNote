@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from app.services.library import library
 from app.services.vault import vault
 from app.utils.response import ResponseWrapper as R
+from app.utils.generation_status import add_generation_errors
 
 router = APIRouter(prefix="/library", tags=["笔记库"])
 
@@ -43,12 +44,13 @@ def perform(action, *args, **kwargs):
 def list_notes(category: str | None = None, search: str = "",
                sort: Literal["created", "name"] = "created", direction: Literal["asc", "desc"] = "desc",
                offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=200)):
-    return perform(library.list_notes, category, search, sort, direction, offset, limit)
+    return perform(lambda: add_generation_errors(
+        library.list_notes(category, search, sort, direction, offset, limit), library.output_dir))
 
 
 @router.get("/notes/{note_id}")
 def get_note(note_id: str):
-    return perform(library.detail, note_id)
+    return perform(lambda: add_generation_errors(library.detail(note_id), library.output_dir))
 
 
 @router.delete("/notes/{note_id}")

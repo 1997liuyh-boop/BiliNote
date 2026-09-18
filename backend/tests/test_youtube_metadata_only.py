@@ -22,6 +22,7 @@ import pathlib
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "app" / "downloaders" / "youtube_downloader.py"
@@ -51,35 +52,37 @@ class _AudioDownloadResult:
 
 def _load_youtube_downloader():
     """Load the module with its app-level dependencies stubbed out."""
-    _stub("app")
-    _stub("app.downloaders")
-    _stub("app.models")
-    _stub("app.services")
-    _stub("app.utils")
-    _stub(
-        "app.downloaders.base",
-        Downloader=_Downloader,
-        DownloadQuality=str,
-        YDL_RETRY_OPTS={"retries": 3, "fragment_retries": 3, "socket_timeout": 30},
-    )
-    _stub("app.downloaders.youtube_subtitle", YouTubeSubtitleFetcher=object)
-    _stub("app.models.notes_model", AudioDownloadResult=_AudioDownloadResult)
-    _stub("app.models.transcriber_model", TranscriptResult=object)
-    _stub(
-        "app.services.proxy_config_manager",
-        ProxyConfigManager=type(
-            "ProxyConfigManager", (), {"get_proxy_url": lambda self: None}
-        ),
-    )
-    _stub("app.utils.path_helper", get_data_dir=lambda: "/tmp")
-    _stub("app.utils.url_parser", extract_video_id=lambda url, platform: "vid")
+    # 避免测试替身污染后续模块导入。
+    with patch.dict(sys.modules):
+        _stub("app")
+        _stub("app.downloaders")
+        _stub("app.models")
+        _stub("app.services")
+        _stub("app.utils")
+        _stub(
+            "app.downloaders.base",
+            Downloader=_Downloader,
+            DownloadQuality=str,
+            YDL_RETRY_OPTS={"retries": 3, "fragment_retries": 3, "socket_timeout": 30},
+        )
+        _stub("app.downloaders.youtube_subtitle", YouTubeSubtitleFetcher=object)
+        _stub("app.models.notes_model", AudioDownloadResult=_AudioDownloadResult)
+        _stub("app.models.transcriber_model", TranscriptResult=object)
+        _stub(
+            "app.services.proxy_config_manager",
+            ProxyConfigManager=type(
+                "ProxyConfigManager", (), {"get_proxy_url": lambda self: None}
+            ),
+        )
+        _stub("app.utils.path_helper", get_data_dir=lambda: "/tmp")
+        _stub("app.utils.url_parser", extract_video_id=lambda url, platform: "vid")
 
-    spec = importlib.util.spec_from_file_location("youtube_downloader", MODULE_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError("youtube_downloader module spec not found")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+        spec = importlib.util.spec_from_file_location("youtube_downloader", MODULE_PATH)
+        if spec is None or spec.loader is None:
+            raise ImportError("youtube_downloader module spec not found")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
 
 
 class _FakeYoutubeDL:

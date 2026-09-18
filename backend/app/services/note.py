@@ -14,6 +14,8 @@ from app.downloaders.bilibili_downloader import BilibiliDownloader
 from app.downloaders.douyin_downloader import DouyinDownloader
 from app.downloaders.local_downloader import LocalDownloader
 from app.downloaders.youtube_downloader import YoutubeDownloader
+from app.downloaders.youtube_errors import youtube_download_error
+from app.utils.url_parser import extract_video_id
 from app.db.video_task_dao import delete_task_by_video, insert_video_task
 from app.enmus.exception import NoteErrorEnum, ProviderErrorEnum
 from app.enmus.task_status_enums import TaskStatus
@@ -147,8 +149,11 @@ class NoteGenerator:
                         full_text=data["full_text"],
                         segments=segments,
                     )
-                    logger.info(f"已从缓存加载转写结果，共 {len(segments)} 段")
+                    if not transcript.full_text.strip() or not any(seg.text.strip() for seg in segments):
+                        transcript = None
+                    logger.info(f"已从缓存读取转写结果，共 {len(segments)} 段")
                 except Exception as e:
+                    transcript = None
                     logger.warning(f"加载转写缓存失败: {e}")
 
             # 缓存没有，尝试获取平台字幕
@@ -156,7 +161,7 @@ class NoteGenerator:
                 logger.info("尝试获取平台字幕（优先于音频下载）...")
                 try:
                     transcript = downloader.download_subtitles(video_url)
-                    if transcript and transcript.segments:
+                    if transcript and transcript.full_text.strip() and any(seg.text.strip() for seg in transcript.segments):
                         logger.info(f"成功获取平台字幕，共 {len(transcript.segments)} 段")
                         transcript_cache_file.write_text(
                             json.dumps(asdict(transcript), ensure_ascii=False, indent=2),
@@ -186,6 +191,7 @@ class NoteGenerator:
                 video_interval=video_interval,
                 grid_size=grid_size,
                 skip_download=not need_full_download,
+                transcript=transcript,
             )
 
             # 3. 如果前面没拿到字幕，走转写流程
@@ -374,6 +380,7 @@ class NoteGenerator:
         video_interval: int,
         grid_size: List[int],
         skip_download: bool = False,
+        transcript: Optional[TranscriptResult] = None,
     ) -> AudioDownloadResult | None:
         """
         1. 检查音频缓存；若不存在，则根据需要下载音频或视频（若需截图/可视化）。
@@ -401,7 +408,13 @@ class NoteGenerator:
             logger.info(f"检测到音频缓存 ({audio_cache_file})，直接读取")
             try:
                 data = json.loads(audio_cache_file.read_text(encoding="utf-8"))
-                return AudioDownloadResult(**data)
+                cached = AudioDownloadResult(**data)
+                # 元数据缓存不代表音频已下载；截图和视频理解也必须检查视频流程。
+                if not screenshot and not video_understanding and (
+                    skip_download or (cached.file_path and Path(cached.file_path).is_file()
+                                      and not (cached.raw_info or {}).get("metadata_only"))
+                ):
+                    return cached
             except Exception as e:
                 logger.warning(f"读取音频缓存失败，将重新下载：{e}")
 
@@ -416,14 +429,24 @@ class NoteGenerator:
                     need_video=False,
                     skip_download=True,
                 )
+            except Exception:
+                # 已有真实字幕时，元数据获取失败不应再触发不必要的音频下载。
+                video_id = extract_video_id(str(video_url), platform) if platform == "youtube" else None
+                if platform == "youtube" and not (video_id and transcript and transcript.full_text.strip() and transcript.segments):
+                    raise
+                audio = AudioDownloadResult(
+                    file_path="", title=f"YouTube 视频 {video_id}",
+                    duration=max((seg.end for seg in transcript.segments), default=0),
+                    cover_url=None, platform=platform, video_id=video_id,
+                    raw_info={"metadata_unavailable": True, "duration_source": "transcript"},
+                ) if platform == "youtube" else None
+                logger.warning("视频元信息不可用，已有字幕时优先继续生成")
+            if audio is not None:
+                audio.raw_info = {**(audio.raw_info or {}), "metadata_only": True}
                 audio_cache_file.write_text(
-                    json.dumps(asdict(audio), ensure_ascii=False, indent=2),
-                    encoding="utf-8",
+                    json.dumps(asdict(audio), ensure_ascii=False, indent=2), encoding="utf-8",
                 )
-                logger.info(f"元信息提取完成 ({audio_cache_file})")
                 return audio
-            except Exception as exc:
-                logger.warning(f"元信息提取失败，将尝试完整下载: {exc}")
 
         # 判断是否需要下载视频
         need_video = screenshot or video_understanding
@@ -450,6 +473,8 @@ class NoteGenerator:
                 else:
                     logger.info("未指定 grid_size，跳过缩略图生成")
             except Exception as exc:
+                if platform == "youtube":
+                    raise RuntimeError(youtube_download_error(exc)) from None
                 logger.error(f"视频下载失败：{exc}")
                 self._handle_exception(task_id, exc)
                 raise
@@ -467,6 +492,8 @@ class NoteGenerator:
             logger.info(f"音频下载并缓存成功 ({audio_cache_file})")
             return audio
         except Exception as exc:
+            if platform == "youtube":
+                raise RuntimeError(youtube_download_error(exc)) from None
             logger.error(f"音频下载失败：{exc}")
             self._handle_exception(task_id, exc)
             raise

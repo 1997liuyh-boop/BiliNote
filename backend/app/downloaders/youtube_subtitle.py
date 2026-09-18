@@ -3,6 +3,7 @@
 优先人工字幕，其次自动生成字幕。不依赖 yt_dlp，无需下载任何文件。
 """
 
+import math
 from typing import Optional, List
 
 from youtube_transcript_api import YouTubeTranscriptApi
@@ -27,9 +28,9 @@ class YouTubeSubtitleFetcher:
                 session = requests.Session()
                 session.proxies = {"http": proxy, "https": proxy}
                 self._api = YouTubeTranscriptApi(http_client=session)
-                logger.info(f"YouTube 字幕走代理: {proxy}")
+                logger.info("YouTube 字幕使用已配置的代理")
             except Exception as e:
-                logger.warning(f"为 youtube-transcript-api 注入代理失败，回退无代理: {e}")
+                logger.warning("为字幕客户端配置代理失败：%s", type(e).__name__)
                 self._api = YouTubeTranscriptApi()
         else:
             self._api = YouTubeTranscriptApi()
@@ -78,16 +79,19 @@ class YouTubeSubtitleFetcher:
             fetched = transcript.fetch()
             segments = []
             for snippet in fetched:
-                text = snippet.get("text", "").strip() if isinstance(snippet, dict) else str(snippet).strip()
-                if not text:
+                # 新版 API 返回数据对象，旧版返回字典；不能把对象描述当成字幕。
+                get = snippet.get if isinstance(snippet, dict) else lambda key, default: getattr(snippet, key, default)
+                text = get("text", "")
+                if not isinstance(text, str) or not text.strip():
                     continue
-                start = snippet.get("start", 0) if isinstance(snippet, dict) else 0
-                duration = snippet.get("duration", 0) if isinstance(snippet, dict) else 0
-                segments.append(TranscriptSegment(
-                    start=float(start),
-                    end=float(start) + float(duration),
-                    text=text,
-                ))
+                try:
+                    start = float(get("start", 0))
+                    duration = float(get("duration", 0))
+                except (TypeError, ValueError):
+                    continue
+                if not all(math.isfinite(value) and value >= 0 for value in (start, duration, start + duration)):
+                    continue
+                segments.append(TranscriptSegment(start=start, end=start + duration, text=text.strip()))
 
             if not segments:
                 logger.warning(f"YouTube 字幕内容为空: {video_id}")
@@ -109,5 +113,5 @@ class YouTubeSubtitleFetcher:
             )
 
         except Exception as e:
-            logger.warning(f"YouTube 字幕获取失败: {e}")
+            logger.warning("YouTube 字幕获取失败：%s", type(e).__name__)
             return None

@@ -135,6 +135,8 @@ export default function LibraryHistory({ onSelect, selectedId }: {
         </span>
         {task.status !== 'SUCCESS' && <span>{task.status === 'FAILED' ? '生成失败' : '生成中'}</span>}
       </div>
+      {task.status === 'FAILED' && task.errorMessage &&
+        <p className="mt-2 break-words rounded bg-red-50 p-2 text-xs leading-5 text-red-700">{task.errorMessage}</p>}
       {task.archiveJob?.published && task.archiveJob.status === 'FAILED' && task.archiveJob.stage !== 'NOTIFY' &&
         <p className="mt-1 text-[10px] text-amber-700">本篇已入库，所属批次未全部完成；请查看最近入库任务。</p>}
       {task.archivePath && <p className="mt-1.5 truncate text-[10px] text-neutral-400" title={task.archivePath}>Vault：{task.archivePath}</p>}

@@ -24,6 +24,7 @@ export interface Task {
   markdown: string | Markdown[]
   transcript: Transcript
   status: TaskStatus
+  errorMessage?: string
   audioMeta: AudioMeta
   createdAt: string
   updatedAt?: string
@@ -95,7 +96,7 @@ export const useTaskStore = create<TaskStore>()(persist((set, get) => ({
     if (!task) return
     const formData = payload || task.formData
     await generateNote({ ...formData, task_id: id })
-    get().updateTaskContent(id, { status: 'PENDING', formData })
+    get().updateTaskContent(id, { status: 'PENDING', errorMessage: '', formData })
   },
   syncHistory: async () => {
     if (get().syncing) return
